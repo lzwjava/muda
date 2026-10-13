@@ -165,18 +165,39 @@ mudaError_t mudaInit(unsigned int flags)
     }
 
     const char *want = getenv("MUDA_DRIVER");
-    if (want && strcmp(want, "opencl") != 0) {
-        fprintf(stderr, "muda: unknown driver '%s' (only 'opencl' is available)\n", want);
-        pthread_mutex_unlock(&g_lock);
-        return fail(mudaErrorNotSupported);
+    const muda_driver *choice = NULL;
+
+    if (want) {
+        if (strcmp(want, "opencl") == 0)
+            choice = &muda_driver_opencl;
+        else if (strcmp(want, "cpu") == 0)
+            choice = &muda_driver_cpu;
+        else {
+            fprintf(stderr, "muda: unknown driver '%s' (available: opencl, cpu)\n", want);
+            pthread_mutex_unlock(&g_lock);
+            return fail(mudaErrorNotSupported);
+        }
+    } else {
+        choice = &muda_driver_opencl;
     }
 
-    g_drv = &muda_driver_opencl;
-    if (g_drv->init() != mudaSuccess) {
-        g_drv = NULL;
-        pthread_mutex_unlock(&g_lock);
-        return fail(mudaErrorNoDevice);
+    if (choice->init() != mudaSuccess) {
+        if (!want) {
+            /* No OpenCL runtime: fall back to the CPU reference driver. */
+            choice = &muda_driver_cpu;
+            if (choice->init() != mudaSuccess) {
+                g_drv = NULL;
+                pthread_mutex_unlock(&g_lock);
+                return fail(mudaErrorNoDevice);
+            }
+        } else {
+            g_drv = NULL;
+            pthread_mutex_unlock(&g_lock);
+            return fail(mudaErrorNoDevice);
+        }
     }
+
+    g_drv = choice;
     g_initialized = 1;
     pthread_mutex_unlock(&g_lock);
     return ok();

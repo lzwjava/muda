@@ -36,10 +36,11 @@ NVIDIA OpenCL runtime still exposes it.
 ## Status
 
 Tested on **Tesla M40 (sm_52)**, driver 580.178.04.  `make test` runs the core
-runtime (35 checks), mudaBLAS (18), the CUDA runtime shim (11) and the CUDA
-source-compatibility suite (5); builds an ordinary `<<<>>>` CUDA program
-through `mudac`; and runs the `mudac` launch-rewrite tests (1D int dims, 2D
-`dim3`, scalar arguments).
+runtime (35 checks), mudaBLAS (18), the CUDA runtime shim (11), the CUDA
+source-compatibility suite (5) and the driver-independent memory suite (8);
+builds ordinary `<<<>>>` CUDA programs through `mudac` (vector add and a block
+reduction); and runs the `mudac` launch-rewrite tests.  `make test-cpu` runs
+the memory suite against the CPU reference driver.
 
 Benchmarks (single run, not tuned):
 
@@ -291,18 +292,20 @@ src/muda.c              runtime state + dispatch to the active driver
 src/muda_internal.h     the muda_driver vtable (the "driver ABI")
 src/muda_translate.c    CUDA C -> OpenCL C rewriter
 src/driver_opencl.c     default driver: dlopen(libOpenCL) + dispatch
+src/driver_cpu.c        CPU reference driver (memory only; no kernels)
 src/mudablas.c          SGEMM/SGEMV and elementwise kernels
 src/mudart.c            CUDA runtime shim implementation
 src/cl_min.h            hand-written minimal OpenCL declarations
 tools/mudainfo.c        device/PCI information tool
 tools/mudac.c           CUDA `<<<>>>` -> mudart preprocessor
 examples/*.c            vector_add, saxpy, matmul, bench_gemm, mlp
-examples/vector_add.cu  ordinary CUDA source, built through mudac
+examples/*.cu           vector_add, reduction (built through mudac)
 python/muda.py          ctypes binding + numpy interop
 tests/test_muda.c       core test suite
 tests/test_mudablas.c   linear algebra test suite
 tests/test_mudart.c     CUDA runtime shim test suite
 tests/test_translate.c  CUDA source compatibility test suite
+tests/test_memory.c     driver-independent memory/stream/event test
 tests/test_mudac.cu     mudac launch-rewrite tests
 ```
 
@@ -311,10 +314,12 @@ A *muda driver* is a vtable of `init`, `malloc`, `memcpy`, `module_load`,
 example a native `nouveau`/MMIO driver) only requires implementing
 `muda_driver` and registering it in `mudaInit`.
 
-The active backend can be selected with the `MUDA_DRIVER` environment variable
-(currently only `opencl`).  Set `MUDA_VERBOSE=1` to dump the generated OpenCL
-build log, and `MUDA_CL_OPTIONS="..."` to pass build options (for example
-`-cl-std=CL3.0`).
+The active backend can be selected with the `MUDA_DRIVER` environment variable:
+`opencl` (default) or `cpu`.  If OpenCL is unavailable, `muda` automatically
+falls back to the CPU reference driver, which supports the full memory,
+stream and event surface but cannot execute kernels.  Set `MUDA_VERBOSE=1` to
+dump the generated OpenCL build log, and `MUDA_CL_OPTIONS="..."` to pass build
+options (for example `-cl-std=CL3.0`).
 
 ## Limitations and honest notes
 
@@ -337,7 +342,8 @@ build log, and `MUDA_CL_OPTIONS="..."` to pass build options (for example
 Done: core CUDA-compatible API (0.2.0); linear algebra + real-workload layer
 (0.3.0: mudaBLAS, GEMM benchmark, MLP training); CUDA runtime shim + Python
 binding (0.4.0); `<<<>>>` preprocessor, `mudac` (0.5.0); expanded CUDA source
-compatibility - intrinsics, atomics, qualifiers (0.6.0).
+compatibility - intrinsics, atomics, qualifiers (0.6.0); CPU reference driver +
+reduction example (0.7.0).
 
 Next:
 

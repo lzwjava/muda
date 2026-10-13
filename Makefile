@@ -13,15 +13,17 @@ CPPFLAGS += -D_GNU_SOURCE -Iinclude -Isrc
 LDLIBS  += -ldl -lpthread -lm
 
 BUILD   := build
-LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c src/mudablas.c src/mudart.c
+LIB_SRC := src/muda.c src/driver_opencl.c src/driver_cpu.c src/muda_translate.c src/mudablas.c src/mudart.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul \
            $(BUILD)/bench_gemm $(BUILD)/mlp $(BUILD)/test_muda \
            $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/test_translate \
-           $(BUILD)/mudac $(BUILD)/vector_add_mudac $(BUILD)/test_mudac
+           $(BUILD)/test_memory \
+           $(BUILD)/mudac $(BUILD)/vector_add_mudac $(BUILD)/reduction_mudac \
+           $(BUILD)/test_mudac
 
-.PHONY: all clean test python
+.PHONY: all clean test test-cpu python
 all: $(BUILD)/libmuda.so $(BUILD)/libmuda.a $(BINS)
 
 $(BUILD):
@@ -81,13 +83,27 @@ $(BUILD)/test_mudac.c: tests/test_mudac.cu $(BUILD)/mudac | $(BUILD)
 $(BUILD)/test_mudac: $(BUILD)/test_mudac.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -x c++ -o $@ $(BUILD)/test_mudac.c -x none $(BUILD)/libmuda.a $(LDLIBS)
 
-test: $(BUILD)/test_muda $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/test_translate $(BUILD)/vector_add_mudac $(BUILD)/test_mudac
+$(BUILD)/reduction_mudac.c: examples/reduction.cu $(BUILD)/mudac | $(BUILD)
+	$(BUILD)/mudac $< -o $@
+
+$(BUILD)/reduction_mudac: $(BUILD)/reduction_mudac.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -x c++ -o $@ $(BUILD)/reduction_mudac.c -x none $(BUILD)/libmuda.a $(LDLIBS)
+
+$(BUILD)/test_memory: tests/test_memory.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+test: $(BUILD)/test_muda $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/test_translate $(BUILD)/test_memory $(BUILD)/vector_add_mudac $(BUILD)/reduction_mudac $(BUILD)/test_mudac
 	$(BUILD)/test_muda
 	$(BUILD)/test_mudablas
 	$(BUILD)/test_mudart
 	$(BUILD)/test_translate
+	$(BUILD)/test_memory
 	$(BUILD)/vector_add_mudac
+	$(BUILD)/reduction_mudac
 	$(BUILD)/test_mudac
+
+test-cpu: $(BUILD)/test_memory
+	MUDA_DRIVER=cpu $(BUILD)/test_memory
 
 python: all
 	$(PYTHON) python/demo_kernel.py

@@ -78,6 +78,7 @@ typedef struct muda_context_impl {
 
 /* Registered backends. */
 extern const muda_driver muda_driver_opencl;
+extern const muda_driver muda_driver_cpu;
 
 /* Utilities shared by backends. */
 char *muda_translate_cuda_to_opencl(const char *source);

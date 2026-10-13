@@ -71,6 +71,39 @@ teardown_nvidia() {
 }
 
 to_nouveau() {
+    # The nvidia modules cannot be removed while anything (gnome-shell, a
+    # browser, the display manager) holds /dev/nvidia*.  Unbinding in that
+    # state wedges the device, so refuse unless the user insists.
+    local refs
+    refs=$(lsmod | awk '$1 == "nvidia" { print $3 }')
+    refs=${refs:-0}
+    if [ "$refs" != "0" ]; then
+        if [ "${FORCE:-0}" != "1" ]; then
+            echo "ERROR: the nvidia driver is still in use (refcount $refs)."
+            echo
+            echo "Switching now can wedge the GPU.  Stop the graphical session first:"
+            echo "  * from a text console (Ctrl+Alt+F3): sudo systemctl isolate multi-user.target"
+            echo "  * or log out of the desktop, then run this again"
+            echo
+            echo "Or re-run with --force to stop the display manager automatically"
+            echo "(this closes the graphical session)."
+            exit 1
+        fi
+        for dm in gdm3 gdm lightdm sddm lxdm; do
+            if systemctl stop "$dm" 2>/dev/null; then
+                echo "stopped display manager: $dm"
+                break
+            fi
+        done
+        sleep 3
+        refs=$(lsmod | awk '$1 == "nvidia" { print $3 }')
+        refs=${refs:-0}
+        if [ "$refs" != "0" ]; then
+            echo "ERROR: nvidia still has refcount $refs; aborting."
+            exit 1
+        fi
+    fi
+
     echo "=== switching $BDF to nouveau ==="
     unbind
     teardown_nvidia
@@ -99,9 +132,13 @@ to_nvidia() {
     status
 }
 
+if [ "${2:-}" = "--force" ]; then
+    FORCE=1
+fi
+
 case "$CMD" in
     status)  status ;;
     nouveau) to_nouveau ;;
     nvidia)  to_nvidia ;;
-    *) echo "usage: $0 {status|nouveau|nvidia}"; exit 2 ;;
+    *) echo "usage: $0 {status|nouveau|nvidia} [--force]"; exit 2 ;;
 esac

@@ -13,7 +13,7 @@ CPPFLAGS += -D_GNU_SOURCE -Iinclude -Isrc
 LDLIBS  += -ldl -lpthread -lm
 
 BUILD   := build
-LIB_SRC := src/muda.c src/driver_opencl.c src/driver_cpu.c src/muda_translate.c src/mudablas.c src/mudart.c
+LIB_SRC := src/muda.c src/driver_opencl.c src/driver_cpu.c src/driver_nouveau.c src/muda_translate.c src/mudablas.c src/mudart.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul \

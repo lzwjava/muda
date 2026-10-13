@@ -282,6 +282,37 @@ vadd(grid=4096, block=256, args=[da, db, dc, n], sync=True)
 See `python/demo_kernel.py` (load + launch a kernel from source) and
 `python/demo_matmul.py` (mudaBLAS benchmark).
 
+## Native backend (`driver_nouveau`) - experimental
+
+`src/driver_nouveau.c` talks straight to the open **nouveau** kernel driver
+through `/dev/dri/renderD*` using the DRM ioctl ABI, with no dependency on
+NVIDIA's user-space stack.  It currently provides:
+
+* device enumeration and properties using `DRM_IOCTL_VERSION`, `GETPARAM`
+  (chipset, PCI id, framebuffer size) and the PCI resource sizes;
+* GPU memory management: `DRM_IOCTL_NOUVEAU_GEM_NEW` + `mmap`, so `mudaMalloc`
+  returns real GEM objects;
+* the full stream/event surface.
+
+Kernel execution is **not implemented yet** (`module_load`/`launch` return
+`mudaErrorNotSupported`); growing a compute channel on top of this is the next
+step.
+
+It requires the nouveau kernel driver to be bound to the M40.  `nouveau` is
+blacklisted by the NVIDIA package, so this needs root.  The helper script does
+it safely and reversibly:
+
+```sh
+tools/muda-gpu-mode.sh status          # show current state (no root)
+sudo tools/muda-gpu-mode.sh nouveau    # unbind nvidia, load nouveau
+MUDA_DRIVER=nouveau build/mudainfo
+sudo tools/muda-gpu-mode.sh nvidia     # switch back
+```
+
+Unbinding only affects the running kernel: a reboot always restores the nvidia
+driver, because nouveau stays blacklisted.  Stop anything using the M40
+(ComfyUI, llama.cpp) first, or `rmmod` will fail.
+
 ## Architecture
 
 ```
@@ -293,11 +324,13 @@ src/muda_internal.h     the muda_driver vtable (the "driver ABI")
 src/muda_translate.c    CUDA C -> OpenCL C rewriter
 src/driver_opencl.c     default driver: dlopen(libOpenCL) + dispatch
 src/driver_cpu.c        CPU reference driver (memory only; no kernels)
+src/driver_nouveau.c    native DRM/nouveau backend (experimental)
 src/mudablas.c          SGEMM/SGEMV and elementwise kernels
 src/mudart.c            CUDA runtime shim implementation
 src/cl_min.h            hand-written minimal OpenCL declarations
 tools/mudainfo.c        device/PCI information tool
 tools/mudac.c           CUDA `<<<>>>` -> mudart preprocessor
+tools/muda-gpu-mode.sh  switch the M40 between nvidia and nouveau
 examples/*.c            vector_add, saxpy, matmul, bench_gemm, mlp
 examples/*.cu           vector_add, reduction (built through mudac)
 python/muda.py          ctypes binding + numpy interop
@@ -315,11 +348,11 @@ example a native `nouveau`/MMIO driver) only requires implementing
 `muda_driver` and registering it in `mudaInit`.
 
 The active backend can be selected with the `MUDA_DRIVER` environment variable:
-`opencl` (default) or `cpu`.  If OpenCL is unavailable, `muda` automatically
-falls back to the CPU reference driver, which supports the full memory,
-stream and event surface but cannot execute kernels.  Set `MUDA_VERBOSE=1` to
-dump the generated OpenCL build log, and `MUDA_CL_OPTIONS="..."` to pass build
-options (for example `-cl-std=CL3.0`).
+`opencl` (default), `cpu` or `nouveau`.  If OpenCL is unavailable, `muda`
+automatically falls back to the CPU reference driver, which supports the full
+memory, stream and event surface but cannot execute kernels.  Set
+`MUDA_VERBOSE=1` to dump the generated OpenCL build log, and
+`MUDA_CL_OPTIONS="..."` to pass build options (for example `-cl-std=CL3.0`).
 
 ## Limitations and honest notes
 
@@ -343,7 +376,12 @@ Done: core CUDA-compatible API (0.2.0); linear algebra + real-workload layer
 (0.3.0: mudaBLAS, GEMM benchmark, MLP training); CUDA runtime shim + Python
 binding (0.4.0); `<<<>>>` preprocessor, `mudac` (0.5.0); expanded CUDA source
 compatibility - intrinsics, atomics, qualifiers (0.6.0); CPU reference driver +
-reduction example (0.7.0).
+reduction example (0.7.0); native DRM/nouveau memory backend + driver switch
+tool (0.8.0, experimental).
+
+Next: give `driver_nouveau` a compute channel (pushbuffer + channel classes)
+so kernels can run with no NVIDIA user space at all; until then it is a memory
+and information backend.
 
 Next:
 

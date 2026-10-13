@@ -172,8 +172,10 @@ mudaError_t mudaInit(unsigned int flags)
             choice = &muda_driver_opencl;
         else if (strcmp(want, "cpu") == 0)
             choice = &muda_driver_cpu;
+        else if (strcmp(want, "nouveau") == 0)
+            choice = &muda_driver_nouveau;
         else {
-            fprintf(stderr, "muda: unknown driver '%s' (available: opencl, cpu)\n", want);
+            fprintf(stderr, "muda: unknown driver '%s' (available: opencl, cpu, nouveau)\n", want);
             pthread_mutex_unlock(&g_lock);
             return fail(mudaErrorNotSupported);
         }

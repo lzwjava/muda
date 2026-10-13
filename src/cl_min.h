@@ -75,6 +75,7 @@ typedef void (*cl_program_callback)(cl_program program, void *user_data);
 #define CL_MEM_READ_WRITE                           (1 << 0)
 #define CL_MEM_WRITE_ONLY                           (1 << 1)
 #define CL_MEM_READ_ONLY                            (1 << 2)
+#define CL_MEM_ALLOC_HOST_PTR                       (1 << 4)
 #define CL_MEM_COPY_HOST_PTR                        (1 << 5)
 
 /* Command queue flags */
@@ -86,6 +87,20 @@ typedef void (*cl_program_callback)(cl_program program, void *user_data);
 /* Profiling info */
 #define CL_PROFILING_COMMAND_START                  0x1282
 #define CL_PROFILING_COMMAND_END                    0x1283
+
+/* Event info */
+#define CL_EVENT_COMMAND_EXECUTION_STATUS           0x11D3
+#define CL_QUEUED                                   0x2
+#define CL_SUBMITTED                                0x3
+#define CL_RUNNING                                  0x1
+#define CL_COMPLETE                                 0x0
+
+/* Kernel work-group info */
+#define CL_KERNEL_WORK_GROUP_SIZE                   0x11B0
+#define CL_KERNEL_COMPILE_WORK_GROUP_SIZE           0x11B1
+#define CL_KERNEL_LOCAL_MEM_SIZE                    0x11B2
+#define CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE 0x11B3
+#define CL_KERNEL_PRIVATE_MEM_SIZE                  0x11B4
 
 #define CL_TRUE  1
 #define CL_FALSE 0
@@ -157,6 +172,12 @@ typedef struct cl_api {
     cl_int (*GetEventProfilingInfo)(cl_event event, cl_uint param_name,
                                     size_t param_value_size, void *param_value,
                                     size_t *param_value_size_ret);
+    cl_int (*GetEventInfo)(cl_event event, cl_uint param_name,
+                           size_t param_value_size, void *param_value,
+                           size_t *param_value_size_ret);
+    cl_int (*GetKernelWorkGroupInfo)(cl_kernel kernel, cl_device_id device,
+                                     cl_uint param_name, size_t param_value_size,
+                                     void *param_value, size_t *param_value_size_ret);
 } cl_api;
 
 /* Loads libOpenCL.so.1 and fills the table.  Returns 0 on success. */

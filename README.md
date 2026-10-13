@@ -36,21 +36,35 @@ NVIDIA OpenCL runtime still exposes it.
 Tested on **Tesla M40 (sm_52)**, driver 580.178.04:
 
 ```
-$ ./build/test_muda
-muda 0.1.0 test suite
+$ make test
+muda 0.2.0 test suite
 driver: opencl
-== device ==
-  device 0: Tesla M40 sm_52, 11436 MiB, 24 SMs
+== device ==               device 0: Tesla M40 sm_52, 11436 MiB, 24 SMs
+== device_queries ==       name=Tesla M40 pci=0000:01:00.0
 == memory ==
+== pointer_attributes ==
+== memcpy_2d ==
+== memset_d32 ==
 == vector_add ==
 == saxpy ==
 == shared_memory_+_syncthreads ==
 == 2d_grid ==
+== packed_launch ==
+== launch_ex ==
+== func_attributes ==      occupancy@256=1 blocks/SM
 == streams_and_events ==
-  kernel time: 0.007 ms
+== stream_event_query ==
 
-13 passed, 0 failed
+35 passed, 0 failed
 ```
+
+Benchmarks (single run, for a feel, not tuned):
+
+| example | result |
+| --- | --- |
+| `vector_add` (1M floats) | ~0.18 ms, ~70 GB/s |
+| `saxpy` (4M floats) | ~0.24 ms, ~210 GB/s |
+| `matmul` 256x256 tiled | ~0.09 ms, ~390 GFLOP/s |
 
 ## Build
 
@@ -58,7 +72,8 @@ No CUDA and no OpenCL development headers are required.
 
 ```sh
 make            # builds build/libmuda.{so,a}, build/mudainfo,
-                # build/vector_add and build/test_muda
+                # build/vector_add, build/saxpy, build/matmul and
+                # build/test_muda
 make test       # runs the test suite
 ```
 
@@ -104,21 +119,24 @@ int main(void)
 }
 ```
 
-See `examples/vector_add.c` for the complete, compilable program and
+See `examples/vector_add.c`, `examples/saxpy.c` (streams + events) and
+`examples/matmul.c` (tiled `__shared__` memory + `__syncthreads`), and
 `tools/mudainfo.c` for a device-information tool.
 
 ## What is implemented
 
 | Area | API |
 | --- | --- |
-| Runtime | `mudaInit`, `mudaShutdown`, `mudaGetDriverName`, `mudaGetLastError` |
-| Devices | `mudaGetDeviceCount`, `mudaGetDeviceProperties` |
-| Contexts | `mudaCtxCreate`, `mudaCtxDestroy`, push/pop/get current |
-| Memory | `mudaMalloc`, `mudaFree`, `mudaMemcpy`, `mudaMemcpyAsync`, `mudaMemset` |
-| Modules | `mudaModuleLoadData`, `mudaModuleLoad`, `mudaModuleUnload`, `mudaModuleGetFunction` |
-| Launch | `mudaLaunchKernel` (1D/2D/3D grids and blocks) |
-| Streams | `mudaStreamCreate`, `mudaStreamDestroy`, `mudaStreamSynchronize` |
-| Events | `mudaEventCreate`, `mudaEventRecord`, `mudaEventSynchronize`, `mudaEventElapsedTime` |
+| Runtime | `mudaInit`, `mudaShutdown`, `mudaGetDriverName`, `mudaGetLastError`, `mudaPeekAtLastError`, `mudaRuntimeGetVersion`, `mudaDriverGetVersion` |
+| Devices | `mudaGetDeviceCount`, `mudaSetDevice`, `mudaGetDevice`, `mudaGetDeviceProperties`, `mudaDeviceGetName`, `mudaDeviceGetAttribute`, `mudaDeviceGetPCIBusId`, `mudaDeviceReset`, `mudaDeviceSynchronize` |
+| Contexts | `mudaCtxCreate`, `mudaCtxDestroy`, push/pop/get current, `mudaCtxGetDevice` |
+| Memory | `mudaMalloc`, `mudaFree`, `mudaMallocHost`, `mudaFreeHost`, `mudaHostGetDevicePointer`, `mudaMemGetInfo`, `mudaPointerGetAttributes` |
+| Copies | `mudaMemcpy`, `mudaMemcpyAsync`, `mudaMemcpy2D`, `mudaMemcpy2DAsync`, `mudaMemset`, `mudaMemsetD8`, `mudaMemsetD32` |
+| Modules | `mudaModuleLoadData`, `mudaModuleLoad`, `mudaModuleUnload`, `mudaModuleGetFunction`, `mudaFuncGetAttributes` |
+| Launch | `mudaLaunchKernel`, `mudaLaunchKernelEx`, packed `extra[]` arguments, `mudaOccupancyMaxActiveBlocksPerMultiprocessor` |
+| Streams | `mudaStreamCreate`, `mudaStreamCreateWithFlags`, `mudaStreamDestroy`, `mudaStreamSynchronize`, `mudaStreamQuery`, `mudaStreamWaitEvent` |
+| Events | `mudaEventCreate`, `mudaEventCreateWithFlags`, `mudaEventRecord`, `mudaEventSynchronize`, `mudaEventQuery`, `mudaEventElapsedTime` |
+| Advisories | `mudaMemAdvise`, `mudaMemPrefetchAsync` (no-ops on this driver) |
 
 ### Kernel language
 
@@ -151,7 +169,7 @@ src/muda_translate.c    CUDA C -> OpenCL C rewriter
 src/driver_opencl.c     default driver: dlopen(libOpenCL) + dispatch
 src/cl_min.h            hand-written minimal OpenCL declarations
 tools/mudainfo.c        device/PCI information tool
-examples/vector_add.c   end-to-end example
+examples/*.c            vector_add, saxpy, matmul
 tests/test_muda.c       test suite
 ```
 
@@ -161,7 +179,8 @@ example a native `nouveau`/MMIO driver) only requires implementing
 `muda_driver` and registering it in `mudaInit`.
 
 The active backend can be selected with the `MUDA_DRIVER` environment variable
-(currently only `opencl`).
+(currently only `opencl`).  Set `MUDA_VERBOSE=1` to dump the generated OpenCL
+build log.
 
 ## Limitations and honest notes
 
@@ -170,19 +189,23 @@ The active backend can be selected with the `MUDA_DRIVER` environment variable
   reimplement GPU bring-up.  What it does provide is a CUDA-compatible surface
   with no dependency on `libcuda` and no need for an `sm_52`-capable CUDA
   toolkit.
-* `mudaLaunchKernel` does not implement the packed `extra` launch form yet.
+* `mudaLaunchKernel`/`mudaLaunchKernelEx` support packed `extra[]` arguments,
+  but the packer assumes natural alignment (`align = min(size, 16)`).
 * Dynamic `__local` memory is supported for a single local parameter per kernel.
 * Struct arguments passed by value are rejected (`mudaErrorNotSupported`)
   because argument sizes are inferred from the kernel signature.
+* `mudaMemAdvise` and `mudaMemPrefetchAsync` are no-ops (there is no managed
+  memory path yet).
 * `mudaCtxPopCurrent` is simplified.
 
 ## Roadmap
 
-* `driver_opencl`: packed `extra` launch, multiple local-memory parameters,
-  better device discovery.
+* `driver_opencl`: multiple local-memory parameters, real free-memory queries,
+  stream priority and overlap hints.
 * `driver_cpu`: a reference driver so the test suite runs without a GPU.
 * `driver_nouveau`: talk to the open `nouveau` kernel driver directly
   (`drm_nouveau` GEM/pushbuf), bypassing NVIDIA user space altogether.
+* Managed memory (`mudaMallocManaged`) with real prefetch/advice semantics.
 * Load PTX/`cubin` through a native channel instead of OpenCL source.
 
 ## License

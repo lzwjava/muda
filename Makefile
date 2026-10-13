@@ -13,7 +13,7 @@ BUILD   := build
 LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
-BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/test_muda
+BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul $(BUILD)/test_muda
 
 .PHONY: all clean test
 all: $(BUILD)/libmuda.so $(BUILD)/libmuda.a $(BINS)
@@ -34,6 +34,12 @@ $(BUILD)/mudainfo: tools/mudainfo.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
 $(BUILD)/vector_add: examples/vector_add.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+$(BUILD)/saxpy: examples/saxpy.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+$(BUILD)/matmul: examples/matmul.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
 $(BUILD)/test_muda: tests/test_muda.c $(BUILD)/libmuda.a | $(BUILD)

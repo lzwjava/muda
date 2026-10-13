@@ -95,6 +95,8 @@ int muda_cl_load(void)
     CL_LOAD_SYM(WaitForEvents);
     CL_LOAD_SYM(ReleaseEvent);
     CL_LOAD_SYM(GetEventProfilingInfo);
+    CL_LOAD_SYM(GetEventInfo);
+    CL_LOAD_SYM(GetKernelWorkGroupInfo);
 
     g_cl_loaded = 1;
     return 0;
@@ -137,13 +139,14 @@ typedef struct {
 } ocl_module;
 
 typedef struct {
-    cl_kernel           kernel;
+    cl_kernel            kernel;
     const ocl_func_meta *meta;
 } ocl_func;
 
 typedef struct {
     cl_context       ctx;
     cl_command_queue q;
+    cl_event         last;
     cl_device_id     dev;
 } ocl_ctx;
 
@@ -151,7 +154,14 @@ typedef struct {
     cl_event ev;
     double   host_start_ms;
     double   host_end_ms;
+    int      disable_timing;
 } ocl_event;
+
+typedef struct {
+    cl_command_queue q;
+    cl_event         last;
+    unsigned         flags;
+} ocl_stream;
 
 static cl_platform_id g_platform;
 static cl_device_id   g_devices[OCL_MAX_DEVICES];
@@ -239,7 +249,6 @@ static void parse_kernels(const char *src, ocl_module *mod)
     mod->nfuncs = 0;
 
     while ((p = strstr(p, "__kernel")) != NULL) {
-        /* whole-word check */
         if (p != src && is_ident_char(p[-1])) {
             p += 8;
             continue;
@@ -253,7 +262,6 @@ static void parse_kernels(const char *src, ocl_module *mod)
         const char *paren = strchr(after, '(');
         if (!paren)
             break;
-        /* function name = last identifier before '(' */
         const char *name_end = paren;
         while (name_end > after && isspace((unsigned char)name_end[-1]))
             name_end--;
@@ -277,7 +285,6 @@ static void parse_kernels(const char *src, ocl_module *mod)
         memcpy(meta->name, name_start, name_len);
         meta->name[name_len] = '\0';
 
-        /* count args */
         int nargs = 0;
         for (size_t i = open + 1; i < close; i++)
             if (src[i] == ',')
@@ -320,7 +327,28 @@ static void parse_kernels(const char *src, ocl_module *mod)
 }
 
 /* ------------------------------------------------------------------ */
-/* Driver implementation                                              */
+/* Stream helpers                                                     */
+/* ------------------------------------------------------------------ */
+static cl_command_queue stream_queue(ocl_ctx *c, void *stream)
+{
+    return stream ? ((ocl_stream *)stream)->q : c->q;
+}
+
+static void stream_set_last(ocl_ctx *c, void *stream, cl_event ev)
+{
+    cl_event *slot = stream ? &((ocl_stream *)stream)->last : &c->last;
+    if (*slot)
+        g_cl.ReleaseEvent(*slot);
+    *slot = ev;
+}
+
+static cl_event stream_get_last(ocl_ctx *c, void *stream)
+{
+    return stream ? ((ocl_stream *)stream)->last : c->last;
+}
+
+/* ------------------------------------------------------------------ */
+/* Device queries                                                     */
 /* ------------------------------------------------------------------ */
 static int opencl_init(void)
 {
@@ -380,10 +408,8 @@ static void get_str(cl_device_id d, cl_uint param, char *dst, size_t cap)
     g_cl.GetDeviceInfo(d, param, cap, dst, NULL);
 }
 
-static int opencl_get_device_props(int device, mudaDeviceProp *prop)
+static int fill_prop(int device, mudaDeviceProp *prop)
 {
-    if (!prop)
-        return mudaErrorInvalidValue;
     if (device < 0 || device >= g_ndev)
         return mudaErrorInvalidDevice;
 
@@ -420,7 +446,12 @@ static int opencl_get_device_props(int device, mudaDeviceProp *prop)
     g_cl.GetDeviceInfo(d, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(u), &u, NULL);
     prop->clockRateKHz = (int)u * 1000;
 
-    /* NVIDIA-specific attributes; ignore failures on other vendors. */
+    prop->maxRegistersPerBlock = 65536;
+    prop->memoryClockRateKHz = 0;
+    prop->memoryBusWidth = 0;
+    prop->memPitch = 2147483647UL;
+    prop->concurrentKernels = 1;
+
     cl_uint cc_major = 0, cc_minor = 0, warp = 0;
     g_cl.GetDeviceInfo(d, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(cc_major), &cc_major, NULL);
     g_cl.GetDeviceInfo(d, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(cc_minor), &cc_minor, NULL);
@@ -440,6 +471,67 @@ static int opencl_get_device_props(int device, mudaDeviceProp *prop)
     return mudaSuccess;
 }
 
+static int opencl_get_device_props(int device, mudaDeviceProp *prop)
+{
+    if (!prop)
+        return mudaErrorInvalidValue;
+    return fill_prop(device, prop);
+}
+
+static int opencl_get_device_attr(int device, int attr, int *value)
+{
+    if (!value)
+        return mudaErrorInvalidValue;
+    mudaDeviceProp p;
+    int e = fill_prop(device, &p);
+    if (e != mudaSuccess)
+        return e;
+
+    switch (attr) {
+    case mudaDevAttrMaxThreadsPerBlock:      *value = p.maxThreadsPerBlock; break;
+    case mudaDevAttrMaxBlockDimX:            *value = p.maxThreadsDim[0]; break;
+    case mudaDevAttrMaxBlockDimY:            *value = p.maxThreadsDim[1]; break;
+    case mudaDevAttrMaxBlockDimZ:            *value = p.maxThreadsDim[2]; break;
+    case mudaDevAttrMaxGridDimX:             *value = p.maxGridSize[0]; break;
+    case mudaDevAttrMaxGridDimY:             *value = p.maxGridSize[1]; break;
+    case mudaDevAttrMaxGridDimZ:             *value = p.maxGridSize[2]; break;
+    case mudaDevAttrMaxSharedMemoryPerBlock: *value = (int)p.sharedMemPerBlock; break;
+    case mudaDevAttrMaxSharedMemoryPerMultiprocessor:
+        *value = (int)p.sharedMemPerMultiprocessor; break;
+    case mudaDevAttrTotalConstantMemory:     *value = 65536; break;
+    case mudaDevAttrWarpSize:                *value = p.warpSize; break;
+    case mudaDevAttrMaxPitch:                *value = (int)p.memPitch; break;
+    case mudaDevAttrMaxRegistersPerBlock:    *value = p.maxRegistersPerBlock; break;
+    case mudaDevAttrClockRate:               *value = p.clockRateKHz; break;
+    case mudaDevAttrMultiProcessorCount:     *value = p.multiProcessorCount; break;
+    case mudaDevAttrConcurrentKernels:       *value = p.concurrentKernels; break;
+    case mudaDevAttrMemoryClockRate:         *value = p.memoryClockRateKHz; break;
+    case mudaDevAttrGlobalMemoryBusWidth:    *value = p.memoryBusWidth; break;
+    case mudaDevAttrComputeCapabilityMajor:  *value = p.computeCapabilityMajor; break;
+    case mudaDevAttrComputeCapabilityMinor:  *value = p.computeCapabilityMinor; break;
+    case mudaDevAttrPciBusId:                *value = p.pciBusID; break;
+    case mudaDevAttrPciDeviceId:             *value = p.pciDeviceID; break;
+    case mudaDevAttrPciDomainId:             *value = p.pciDomainID; break;
+    default:                                 return mudaErrorInvalidValue;
+    }
+    return mudaSuccess;
+}
+
+static int opencl_get_device_pci_bus_id(int device, char *buf, int len)
+{
+    if (!buf || len <= 0 || device < 0 || device >= g_ndev)
+        return mudaErrorInvalidValue;
+    mudaDeviceProp p;
+    if (fill_prop(device, &p) != mudaSuccess)
+        return mudaErrorInvalidDevice;
+    snprintf(buf, (size_t)len, "%04x:%02x:%02x.%x",
+             p.pciDomainID, p.pciBusID, p.pciDeviceID >> 3, p.pciDeviceID & 7);
+    return mudaSuccess;
+}
+
+/* ------------------------------------------------------------------ */
+/* Context                                                            */
+/* ------------------------------------------------------------------ */
 static int opencl_ctx_create(void **drv_ctx, int device)
 {
     if (device < 0 || device >= g_ndev)
@@ -471,6 +563,8 @@ static void opencl_ctx_destroy(void *drv_ctx)
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
     if (!c)
         return;
+    if (c->last)
+        g_cl.ReleaseEvent(c->last);
     if (c->q)
         g_cl.ReleaseCommandQueue(c->q);
     if (c->ctx)
@@ -478,6 +572,9 @@ static void opencl_ctx_destroy(void *drv_ctx)
     free(c);
 }
 
+/* ------------------------------------------------------------------ */
+/* Memory                                                             */
+/* ------------------------------------------------------------------ */
 static int opencl_malloc(void *drv_ctx, void **ptr, size_t size)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
@@ -491,11 +588,42 @@ static int opencl_malloc(void *drv_ctx, void **ptr, size_t size)
     return mudaSuccess;
 }
 
+static int opencl_malloc_host(void *drv_ctx, void **ptr, size_t size)
+{
+    (void)drv_ctx;
+    if (!ptr || size == 0)
+        return mudaErrorInvalidValue;
+    void *p = malloc(size);
+    if (!p)
+        return mudaErrorOutOfMemory;
+    *ptr = p;
+    return mudaSuccess;
+}
+
 static int opencl_free(void *drv_ctx, void *ptr)
 {
     (void)drv_ctx;
     if (ptr)
         g_cl.ReleaseMemObject((cl_mem)ptr);
+    return mudaSuccess;
+}
+
+static int opencl_free_host(void *drv_ctx, void *ptr)
+{
+    (void)drv_ctx;
+    free(ptr);
+    return mudaSuccess;
+}
+
+static int opencl_mem_get_info(void *drv_ctx, size_t *freeBytes, size_t *totalBytes)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    cl_ulong total = 0;
+    g_cl.GetDeviceInfo(c->dev, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(total), &total, NULL);
+    if (totalBytes)
+        *totalBytes = (size_t)total;
+    if (freeBytes)
+        *freeBytes = (size_t)total;
     return mudaSuccess;
 }
 
@@ -527,26 +655,77 @@ static int opencl_memcpy_async(void *drv_ctx, void *dst, const void *src, size_t
                                int kind, void *stream)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
-    cl_command_queue q = stream ? (cl_command_queue)stream : c->q;
+    cl_command_queue q = stream_queue(c, stream);
+    cl_event ev = NULL;
     cl_int err = CL_SUCCESS;
 
     switch (kind) {
     case mudaMemcpyHostToHost:
         memcpy(dst, src, size);
-        break;
+        return mudaSuccess;
     case mudaMemcpyHostToDevice:
-        err = g_cl.EnqueueWriteBuffer(q, (cl_mem)dst, CL_FALSE, 0, size, src, 0, NULL, NULL);
+        err = g_cl.EnqueueWriteBuffer(q, (cl_mem)dst, CL_FALSE, 0, size, src, 0, NULL, &ev);
         break;
     case mudaMemcpyDeviceToHost:
-        err = g_cl.EnqueueReadBuffer(q, (cl_mem)src, CL_FALSE, 0, size, dst, 0, NULL, NULL);
+        err = g_cl.EnqueueReadBuffer(q, (cl_mem)src, CL_FALSE, 0, size, dst, 0, NULL, &ev);
         break;
     case mudaMemcpyDeviceToDevice:
-        err = g_cl.EnqueueCopyBuffer(q, (cl_mem)src, (cl_mem)dst, 0, 0, size, 0, NULL, NULL);
+        err = g_cl.EnqueueCopyBuffer(q, (cl_mem)src, (cl_mem)dst, 0, 0, size, 0, NULL, &ev);
         break;
     default:
         return mudaErrorInvalidValue;
     }
-    return err == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
+    if (err != CL_SUCCESS)
+        return mudaErrorUnknown;
+    stream_set_last(c, stream, ev);
+    return mudaSuccess;
+}
+
+static int opencl_memcpy_2d(void *drv_ctx, void *dst, size_t dpitch, const void *src,
+                            size_t spitch, size_t width, size_t height, int kind,
+                            int async, void *stream)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    cl_command_queue q = stream_queue(c, stream);
+    cl_uint blocking = async ? CL_FALSE : CL_TRUE;
+    cl_event ev = NULL;
+    cl_int err = CL_SUCCESS;
+
+    for (size_t row = 0; row < height; row++) {
+        const char *s = (const char *)src + row * spitch;
+        char *d = (char *)dst + row * dpitch;
+        switch (kind) {
+        case mudaMemcpyHostToHost:
+            memcpy(d, s, width);
+            break;
+        case mudaMemcpyHostToDevice:
+            err = g_cl.EnqueueWriteBuffer(q, (cl_mem)dst, CL_TRUE,
+                                          row * dpitch, width, s, 0, NULL, NULL);
+            break;
+        case mudaMemcpyDeviceToHost:
+            err = g_cl.EnqueueReadBuffer(q, (cl_mem)src, CL_TRUE,
+                                         row * spitch, width, d, 0, NULL, NULL);
+            break;
+        case mudaMemcpyDeviceToDevice:
+            err = g_cl.EnqueueCopyBuffer(q, (cl_mem)src, (cl_mem)dst,
+                                         row * spitch, row * dpitch, width, 0, NULL, NULL);
+            break;
+        default:
+            return mudaErrorInvalidValue;
+        }
+        if (err != CL_SUCCESS)
+            return mudaErrorUnknown;
+    }
+
+    /* For the async host<->device cases we issued blocking per-row copies
+     * above; convert to a single async marker so the stream is queryable. */
+    if (async && kind != mudaMemcpyHostToHost) {
+        err = g_cl.EnqueueMarkerWithWaitList(q, 0, NULL, &ev);
+        if (err == CL_SUCCESS)
+            stream_set_last(c, stream, ev);
+    }
+    (void)blocking;
+    return mudaSuccess;
 }
 
 static int opencl_memset(void *drv_ctx, void *ptr, int value, size_t size)
@@ -560,7 +739,6 @@ static int opencl_memset(void *drv_ctx, void *ptr, int value, size_t size)
         if (err == CL_SUCCESS)
             return mudaSuccess;
     }
-    /* Fallback: stage through host memory. */
     unsigned char *tmp = (unsigned char *)malloc(size);
     if (!tmp)
         return mudaErrorOutOfMemory;
@@ -570,6 +748,17 @@ static int opencl_memset(void *drv_ctx, void *ptr, int value, size_t size)
     return err == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
 }
 
+static int opencl_memset_d32(void *drv_ctx, void *ptr, unsigned value, size_t count)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    cl_int err = g_cl.EnqueueFillBuffer(c->q, (cl_mem)ptr, &value, sizeof(value),
+                                        0, count * sizeof(unsigned), 0, NULL, NULL);
+    return err == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
+}
+
+/* ------------------------------------------------------------------ */
+/* Modules / kernels                                                  */
+/* ------------------------------------------------------------------ */
 static int opencl_module_load(void *drv_ctx, const char *source, void **mod_out)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
@@ -585,7 +774,7 @@ static int opencl_module_load(void *drv_ctx, const char *source, void **mod_out)
         return mudaErrorInvalidValue;
 
     err = g_cl.BuildProgram(prog, 1, &c->dev, NULL, NULL, NULL);
-    if (err != CL_SUCCESS) {
+    if (err != CL_SUCCESS || getenv("MUDA_VERBOSE")) {
         size_t log_size = 0;
         g_cl.GetProgramBuildInfo(prog, c->dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
         if (log_size > 0) {
@@ -594,10 +783,15 @@ static int opencl_module_load(void *drv_ctx, const char *source, void **mod_out)
                 g_cl.GetProgramBuildInfo(prog, c->dev, CL_PROGRAM_BUILD_LOG,
                                          log_size, log, NULL);
                 log[log_size] = '\0';
-                fprintf(stderr, "muda: OpenCL build failed:\n%s\n", log);
+                if (err != CL_SUCCESS)
+                    fprintf(stderr, "muda: OpenCL build failed:\n%s\n", log);
+                else
+                    fprintf(stderr, "muda: OpenCL build log:\n%s\n", log);
                 free(log);
             }
         }
+    }
+    if (err != CL_SUCCESS) {
         g_cl.ReleaseProgram(prog);
         return mudaErrorLaunchFailure;
     }
@@ -610,7 +804,6 @@ static int opencl_module_load(void *drv_ctx, const char *source, void **mod_out)
     mod->prog = prog;
     mod->dev = c->dev;
 
-    /* Re-translate just to parse signatures (cheap, keeps state simple). */
     char *opencl_src2 = muda_translate_cuda_to_opencl(source);
     if (opencl_src2) {
         parse_kernels(opencl_src2, mod);
@@ -643,6 +836,7 @@ static int opencl_module_unload(void *drv_ctx, void *mod_ptr)
 static int opencl_func_get(void *drv_ctx, void *mod_ptr, const char *name, void **fn_out)
 {
     ocl_module *mod = (ocl_module *)mod_ptr;
+    (void)drv_ctx;
 
     const ocl_func_meta *meta = NULL;
     for (int i = 0; i < mod->nfuncs; i++) {
@@ -670,18 +864,55 @@ static int opencl_func_get(void *drv_ctx, void *mod_ptr, const char *name, void 
     return mudaSuccess;
 }
 
-static int opencl_launch(void *drv_ctx, void *fn_ptr, unsigned grid[3], unsigned block[3],
-                         unsigned shared, void *stream, void **args)
+static int opencl_func_get_attributes(void *drv_ctx, void *fn_ptr, mudaFuncAttributes *attr)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
     ocl_func *f = (ocl_func *)fn_ptr;
-    cl_command_queue q = stream ? (cl_command_queue)stream : c->q;
+    if (!attr || !f)
+        return mudaErrorInvalidValue;
 
+    memset(attr, 0, sizeof(*attr));
+    size_t v = 0;
+    if (g_cl.GetKernelWorkGroupInfo(f->kernel, c->dev, CL_KERNEL_WORK_GROUP_SIZE,
+                                    sizeof(v), &v, NULL) == CL_SUCCESS)
+        attr->maxThreadsPerBlock = (int)v;
+    if (g_cl.GetKernelWorkGroupInfo(f->kernel, c->dev, CL_KERNEL_LOCAL_MEM_SIZE,
+                                    sizeof(v), &v, NULL) == CL_SUCCESS)
+        attr->sharedSizeBytes = v;
+    if (g_cl.GetKernelWorkGroupInfo(f->kernel, c->dev, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                    sizeof(v), &v, NULL) == CL_SUCCESS)
+        attr->localSizeBytes = v;
+    attr->numRegs = 0;
+    return mudaSuccess;
+}
+
+static size_t align_up(size_t v, size_t a)
+{
+    return a ? ((v + a - 1) / a) * a : v;
+}
+
+static int opencl_launch(void *drv_ctx, void *fn_ptr, unsigned grid[3], unsigned block[3],
+                         unsigned shared, void *stream, void **args,
+                         void *packed, size_t packed_size)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    ocl_func *f = (ocl_func *)fn_ptr;
+    cl_command_queue q = stream_queue(c, stream);
+
+    size_t offset = 0;
     for (int i = 0; i < f->meta->nargs; i++) {
         const ocl_arg *a = &f->meta->args[i];
         cl_int err;
         if (a->is_local) {
             err = g_cl.SetKernelArg(f->kernel, (cl_uint)i, shared, NULL);
+        } else if (packed) {
+            size_t align = a->size > 16 ? 16 : a->size;
+            offset = align_up(offset, align);
+            if (offset + a->size > packed_size)
+                return mudaErrorInvalidValue;
+            err = g_cl.SetKernelArg(f->kernel, (cl_uint)i, a->size,
+                                    (const char *)packed + offset);
+            offset += a->size;
         } else {
             if (!args || !args[i])
                 return mudaErrorInvalidValue;
@@ -700,38 +931,91 @@ static int opencl_launch(void *drv_ctx, void *fn_ptr, unsigned grid[3], unsigned
     };
     size_t local[3] = { block[0], block[1], block[2] };
 
+    cl_event ev = NULL;
     cl_int err = g_cl.EnqueueNDRangeKernel(q, f->kernel, 3, NULL, global, local,
-                                           0, NULL, NULL);
+                                           0, NULL, &ev);
     if (err != CL_SUCCESS) {
         fprintf(stderr, "muda: enqueue failed (cl err %d)\n", err);
         return mudaErrorLaunchFailure;
     }
+    stream_set_last(c, stream, ev);
     return mudaSuccess;
 }
 
-static int opencl_stream_create(void *drv_ctx, void **stream)
+/* ------------------------------------------------------------------ */
+/* Streams                                                            */
+/* ------------------------------------------------------------------ */
+static int opencl_stream_create(void *drv_ctx, void **stream, unsigned flags)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    ocl_stream *s = (ocl_stream *)calloc(1, sizeof(ocl_stream));
+    if (!s)
+        return mudaErrorOutOfMemory;
     cl_int err;
-    cl_command_queue q = g_cl.CreateCommandQueue(c->ctx, c->dev, CL_QUEUE_PROFILING_ENABLE, &err);
-    if (err != CL_SUCCESS || !q)
+    s->q = g_cl.CreateCommandQueue(c->ctx, c->dev, CL_QUEUE_PROFILING_ENABLE, &err);
+    if (err != CL_SUCCESS || !s->q) {
+        free(s);
         return mudaErrorUnknown;
-    *stream = q;
+    }
+    s->flags = flags;
+    *stream = s;
     return mudaSuccess;
 }
 
 static void opencl_stream_destroy(void *drv_ctx, void *stream)
 {
     (void)drv_ctx;
-    if (stream)
-        g_cl.ReleaseCommandQueue((cl_command_queue)stream);
+    ocl_stream *s = (ocl_stream *)stream;
+    if (!s)
+        return;
+    if (s->last)
+        g_cl.ReleaseEvent(s->last);
+    if (s->q)
+        g_cl.ReleaseCommandQueue(s->q);
+    free(s);
 }
 
 static int opencl_stream_sync(void *drv_ctx, void *stream)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
-    cl_command_queue q = stream ? (cl_command_queue)stream : c->q;
-    return g_cl.Finish(q) == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
+    return g_cl.Finish(stream_queue(c, stream)) == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
+}
+
+static int event_status(cl_event ev)
+{
+    if (!ev)
+        return CL_COMPLETE;
+    cl_int status = CL_QUEUED;
+    if (g_cl.GetEventInfo(ev, CL_EVENT_COMMAND_EXECUTION_STATUS,
+                          sizeof(status), &status, NULL) != CL_SUCCESS)
+        return CL_COMPLETE;
+    return status;
+}
+
+static int opencl_stream_query(void *drv_ctx, void *stream)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    cl_event ev = stream_get_last(c, stream);
+    if (!ev)
+        return mudaSuccess;
+    return event_status(ev) == CL_COMPLETE ? mudaSuccess : mudaErrorNotReady;
+}
+
+static int opencl_stream_wait_event(void *drv_ctx, void *stream, void *event)
+{
+    ocl_ctx *c = (ocl_ctx *)drv_ctx;
+    ocl_event *e = (ocl_event *)event;
+    cl_command_queue q = stream_queue(c, stream);
+    cl_event marker = NULL;
+
+    if (!e || !e->ev)
+        return mudaSuccess;
+
+    cl_int err = g_cl.EnqueueMarkerWithWaitList(q, 1, &e->ev, &marker);
+    if (err != CL_SUCCESS)
+        return mudaErrorUnknown;
+    stream_set_last(c, stream, marker);
+    return mudaSuccess;
 }
 
 static int opencl_device_sync(void *drv_ctx)
@@ -740,12 +1024,16 @@ static int opencl_device_sync(void *drv_ctx)
     return g_cl.Finish(c->q) == CL_SUCCESS ? mudaSuccess : mudaErrorUnknown;
 }
 
-static int opencl_event_create(void *drv_ctx, void **event)
+/* ------------------------------------------------------------------ */
+/* Events                                                             */
+/* ------------------------------------------------------------------ */
+static int opencl_event_create(void *drv_ctx, void **event, unsigned flags)
 {
     (void)drv_ctx;
     ocl_event *e = (ocl_event *)calloc(1, sizeof(ocl_event));
     if (!e)
         return mudaErrorOutOfMemory;
+    e->disable_timing = (flags & mudaEventDisableTiming) ? 1 : 0;
     *event = e;
     return mudaSuccess;
 }
@@ -765,7 +1053,7 @@ static int opencl_event_record(void *drv_ctx, void *event, void *stream)
 {
     ocl_ctx *c = (ocl_ctx *)drv_ctx;
     ocl_event *e = (ocl_event *)event;
-    cl_command_queue q = stream ? (cl_command_queue)stream : c->q;
+    cl_command_queue q = stream_queue(c, stream);
 
     if (e->ev) {
         g_cl.ReleaseEvent(e->ev);
@@ -792,6 +1080,15 @@ static int opencl_event_sync(void *drv_ctx, void *event)
     return mudaSuccess;
 }
 
+static int opencl_event_query(void *drv_ctx, void *event)
+{
+    (void)drv_ctx;
+    ocl_event *e = (ocl_event *)event;
+    if (!e || !e->ev)
+        return mudaSuccess;
+    return event_status(e->ev) == CL_COMPLETE ? mudaSuccess : mudaErrorNotReady;
+}
+
 static int opencl_event_elapsed(void *drv_ctx, float *ms, void *start, void *end)
 {
     (void)drv_ctx;
@@ -800,7 +1097,7 @@ static int opencl_event_elapsed(void *drv_ctx, float *ms, void *start, void *end
     if (!ms || !a || !b)
         return mudaErrorInvalidValue;
 
-    if (a->ev && b->ev) {
+    if (a->ev && b->ev && !a->disable_timing && !b->disable_timing) {
         cl_ulong ta = 0, tb = 0;
         cl_int e1 = g_cl.GetEventProfilingInfo(a->ev, CL_PROFILING_COMMAND_END,
                                                sizeof(ta), &ta, NULL);
@@ -816,29 +1113,40 @@ static int opencl_event_elapsed(void *drv_ctx, float *ms, void *start, void *end
 }
 
 const muda_driver muda_driver_opencl = {
-    .name                  = "opencl",
-    .init                  = opencl_init,
-    .shutdown              = opencl_shutdown,
-    .get_device_count      = opencl_get_device_count,
-    .get_device_props      = opencl_get_device_props,
-    .ctx_create            = opencl_ctx_create,
-    .ctx_destroy           = opencl_ctx_destroy,
-    .malloc                = opencl_malloc,
-    .free                  = opencl_free,
-    .memcpy                = opencl_memcpy,
-    .memcpy_async          = opencl_memcpy_async,
-    .memset                = opencl_memset,
-    .module_load           = opencl_module_load,
-    .module_unload         = opencl_module_unload,
-    .func_get              = opencl_func_get,
-    .launch                = opencl_launch,
-    .stream_create         = opencl_stream_create,
-    .stream_destroy        = opencl_stream_destroy,
-    .stream_sync           = opencl_stream_sync,
-    .device_sync           = opencl_device_sync,
-    .event_create          = opencl_event_create,
-    .event_destroy         = opencl_event_destroy,
-    .event_record          = opencl_event_record,
-    .event_sync            = opencl_event_sync,
-    .event_elapsed         = opencl_event_elapsed,
+    .name                     = "opencl",
+    .init                     = opencl_init,
+    .shutdown                 = opencl_shutdown,
+    .get_device_count         = opencl_get_device_count,
+    .get_device_props         = opencl_get_device_props,
+    .get_device_attr          = opencl_get_device_attr,
+    .get_device_pci_bus_id    = opencl_get_device_pci_bus_id,
+    .ctx_create               = opencl_ctx_create,
+    .ctx_destroy              = opencl_ctx_destroy,
+    .malloc                   = opencl_malloc,
+    .malloc_host              = opencl_malloc_host,
+    .free                     = opencl_free,
+    .free_host                = opencl_free_host,
+    .mem_get_info             = opencl_mem_get_info,
+    .memcpy                   = opencl_memcpy,
+    .memcpy_async             = opencl_memcpy_async,
+    .memcpy_2d                = opencl_memcpy_2d,
+    .memset                   = opencl_memset,
+    .memset_d32               = opencl_memset_d32,
+    .module_load              = opencl_module_load,
+    .module_unload            = opencl_module_unload,
+    .func_get                 = opencl_func_get,
+    .func_get_attributes      = opencl_func_get_attributes,
+    .launch                   = opencl_launch,
+    .stream_create            = opencl_stream_create,
+    .stream_destroy           = opencl_stream_destroy,
+    .stream_sync              = opencl_stream_sync,
+    .stream_query             = opencl_stream_query,
+    .stream_wait_event        = opencl_stream_wait_event,
+    .device_sync              = opencl_device_sync,
+    .event_create             = opencl_event_create,
+    .event_destroy            = opencl_event_destroy,
+    .event_record             = opencl_event_record,
+    .event_sync               = opencl_event_sync,
+    .event_query              = opencl_event_query,
+    .event_elapsed            = opencl_event_elapsed,
 };

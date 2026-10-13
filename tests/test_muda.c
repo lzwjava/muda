@@ -346,6 +346,251 @@ static void test_streams_and_events(void)
     free(c);
 }
 
+static void test_device_queries(void)
+{
+    TEST("device_queries");
+    int v = 0;
+    MUDA(mudaDeviceGetAttribute(&v, mudaDevAttrComputeCapabilityMajor, 0));
+    OK(v >= 5);
+    MUDA(mudaDeviceGetAttribute(&v, mudaDevAttrComputeCapabilityMinor, 0));
+    OK(v >= 0);
+    MUDA(mudaDeviceGetAttribute(&v, mudaDevAttrWarpSize, 0));
+    OK(v == 32);
+    MUDA(mudaDeviceGetAttribute(&v, mudaDevAttrMultiProcessorCount, 0));
+    OK(v > 0);
+    MUDA(mudaDeviceGetAttribute(&v, mudaDevAttrMaxThreadsPerBlock, 0));
+    OK(v >= 256);
+
+    char name[256];
+    MUDA(mudaDeviceGetName(name, sizeof(name), 0));
+    OK(strlen(name) > 0);
+
+    char pci[64];
+    MUDA(mudaDeviceGetPCIBusId(pci, sizeof(pci), 0));
+    OK(strlen(pci) > 0);
+    printf("  name=%s pci=%s\n", name, pci);
+
+    int dev = -1;
+    MUDA(mudaGetDevice(&dev));
+    OK(dev == 0);
+    MUDA(mudaSetDevice(0));
+
+    int ver = 0;
+    MUDA(mudaRuntimeGetVersion(&ver));
+    OK(ver == MUDA_VERSION);
+    MUDA(mudaDriverGetVersion(&ver));
+    OK(ver == MUDA_VERSION);
+
+    size_t fr = 0, tot = 0;
+    MUDA(mudaMemGetInfo(&fr, &tot));
+    OK(tot > 0 && fr <= tot);
+    printf("  free %.0f MiB / total %.0f MiB\n",
+           (double)fr / 1048576.0, (double)tot / 1048576.0);
+}
+
+static void test_pointer_attributes(void)
+{
+    TEST("pointer_attributes");
+    void *d = NULL;
+    MUDA(mudaMalloc(&d, 1024));
+    mudaPointerAttributes pa;
+    MUDA(mudaPointerGetAttributes(&pa, d));
+    OK(pa.type == mudaMemoryTypeDevice);
+    OK(pa.devicePointer == d);
+
+    void *h = NULL;
+    MUDA(mudaMallocHost(&h, 1024));
+    OK(h != NULL);
+    MUDA(mudaPointerGetAttributes(&pa, h));
+    OK(pa.type == mudaMemoryTypeHost);
+
+    void *dp = NULL;
+    MUDA(mudaHostGetDevicePointer(&dp, h, 0));
+    OK(dp == h);
+
+    MUDA(mudaFreeHost(h));
+    MUDA(mudaFree(d));
+}
+
+static void test_memcpy_2d(void)
+{
+    TEST("memcpy_2d");
+    const int W = 32, H = 16;
+    const size_t spitch = (size_t)W * sizeof(float);
+    const size_t dpitch = (size_t)(W + 8) * sizeof(float);
+    float *src = (float *)malloc(spitch * H);
+    float *dst = (float *)malloc(dpitch * H);
+    for (int i = 0; i < W * H; i++)
+        src[i] = (float)i;
+    memset(dst, 0, dpitch * H);
+
+    void *ds = NULL, *dd = NULL;
+    MUDA(mudaMalloc(&ds, spitch * H));
+    MUDA(mudaMalloc(&dd, dpitch * H));
+
+    MUDA(mudaMemcpy2D(ds, spitch, src, spitch, W * sizeof(float), H, mudaMemcpyHostToDevice));
+    MUDA(mudaMemcpy2D(dd, dpitch, ds, spitch, W * sizeof(float), H, mudaMemcpyDeviceToDevice));
+    MUDA(mudaMemcpy2D(dst, dpitch, dd, dpitch, W * sizeof(float), H, mudaMemcpyDeviceToHost));
+
+    int ok = 1;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            if (dst[y * (dpitch / 4) + x] != src[y * (spitch / 4) + x])
+                ok = 0;
+    OK(ok);
+
+    MUDA(mudaFree(ds));
+    MUDA(mudaFree(dd));
+    free(src);
+    free(dst);
+}
+
+static void test_memset_d32(void)
+{
+    TEST("memset_d32");
+    const int N = 256;
+    void *d = NULL;
+    MUDA(mudaMalloc(&d, N * sizeof(unsigned)));
+    MUDA(mudaMemsetD32(d, 0xDEADBEEF, N));
+    unsigned out[256];
+    MUDA(mudaMemcpy(out, d, sizeof(out), mudaMemcpyDeviceToHost));
+    int ok = 1;
+    for (int i = 0; i < N; i++)
+        if (out[i] != 0xDEADBEEF)
+            ok = 0;
+    OK(ok);
+    MUDA(mudaFree(d));
+}
+
+static void test_packed_launch(void)
+{
+    TEST("packed_launch");
+    const int N = 2048;
+    const size_t bytes = N * sizeof(float);
+    float *a = malloc(bytes), *b = malloc(bytes), *c = malloc(bytes);
+    for (int i = 0; i < N; i++) {
+        a[i] = (float)i;
+        b[i] = 1.0f;
+    }
+    void *da = NULL, *db = NULL, *dc = NULL;
+    MUDA(mudaMalloc(&da, bytes));
+    MUDA(mudaMalloc(&db, bytes));
+    MUDA(mudaMalloc(&dc, bytes));
+    MUDA(mudaMemcpy(da, a, bytes, mudaMemcpyHostToDevice));
+    MUDA(mudaMemcpy(db, b, bytes, mudaMemcpyHostToDevice));
+
+    /* Manually pack the arguments the way CUDA's extra[] interface does. */
+    unsigned char packed[64];
+    size_t off = 0;
+    int n = N;
+    memcpy(packed + off, &da, sizeof(void *)); off += sizeof(void *);
+    memcpy(packed + off, &db, sizeof(void *)); off += sizeof(void *);
+    memcpy(packed + off, &dc, sizeof(void *)); off += sizeof(void *);
+    memcpy(packed + off, &n, sizeof(int));        off += sizeof(int);
+    size_t packed_size = off;
+
+    void *extra[] = {
+        MUDA_LAUNCH_PARAM_BUFFER_POINTER, packed,
+        MUDA_LAUNCH_PARAM_BUFFER_SIZE,    &packed_size,
+        MUDA_LAUNCH_PARAM_END
+    };
+
+    mudaFunction_t fn = get_kernel("vector_add");
+    MUDA(mudaLaunchKernel(fn, N / 256, 1, 1, 256, 1, 1, 0, NULL, NULL, extra));
+    MUDA(mudaDeviceSynchronize());
+    MUDA(mudaMemcpy(c, dc, bytes, mudaMemcpyDeviceToHost));
+
+    int ok = 1;
+    for (int i = 0; i < N; i++)
+        if (fabsf(c[i] - (a[i] + b[i])) > 1e-4f)
+            ok = 0;
+    OK(ok);
+
+    MUDA(mudaFree(da));
+    MUDA(mudaFree(db));
+    MUDA(mudaFree(dc));
+    free(a);
+    free(b);
+    free(c);
+}
+
+static void test_launch_ex(void)
+{
+    TEST("launch_ex");
+    const int N = 1024;
+    const size_t bytes = N * sizeof(float);
+    float *a = malloc(bytes), *b = malloc(bytes), *c = malloc(bytes);
+    for (int i = 0; i < N; i++) {
+        a[i] = 2.0f;
+        b[i] = 3.0f;
+    }
+    void *da = NULL, *db = NULL, *dc = NULL;
+    MUDA(mudaMalloc(&da, bytes));
+    MUDA(mudaMalloc(&db, bytes));
+    MUDA(mudaMalloc(&dc, bytes));
+    MUDA(mudaMemcpy(da, a, bytes, mudaMemcpyHostToDevice));
+    MUDA(mudaMemcpy(db, b, bytes, mudaMemcpyHostToDevice));
+
+    int n = N;
+    void *args[] = { &da, &db, &dc, &n };
+    mudaLaunchConfig cfg = mudaLaunchConfigDefault;
+    cfg.gridDimX = N / 128;
+    cfg.blockDimX = 128;
+
+    mudaFunction_t fn = get_kernel("vector_add");
+    MUDA(mudaLaunchKernelEx(&cfg, fn, args, NULL));
+    MUDA(mudaDeviceSynchronize());
+    MUDA(mudaMemcpy(c, dc, bytes, mudaMemcpyDeviceToHost));
+
+    int ok = 1;
+    for (int i = 0; i < N; i++)
+        if (fabsf(c[i] - 5.0f) > 1e-4f)
+            ok = 0;
+    OK(ok);
+
+    MUDA(mudaFree(da));
+    MUDA(mudaFree(db));
+    MUDA(mudaFree(dc));
+    free(a);
+    free(b);
+    free(c);
+}
+
+static void test_func_attributes(void)
+{
+    TEST("func_attributes");
+    mudaFunction_t fn = get_kernel("vector_add");
+    mudaFuncAttributes fa;
+    MUDA(mudaFuncGetAttributes(&fa, fn));
+    OK(fa.maxThreadsPerBlock > 0);
+
+    int nb = 0;
+    MUDA(mudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, fn, 256, 0));
+    OK(nb >= 1);
+    printf("  maxThreadsPerBlock=%d occupancy@256=%d blocks/SM\n",
+           fa.maxThreadsPerBlock, nb);
+}
+
+static void test_stream_event_query(void)
+{
+    TEST("stream_event_query");
+    mudaStream_t s;
+    MUDA(mudaStreamCreateWithFlags(&s, mudaStreamNonBlocking));
+    mudaEvent_t ev;
+    MUDA(mudaEventCreateWithFlags(&ev, mudaEventDisableTiming));
+
+    MUDA(mudaEventRecord(ev, s));
+    MUDA(mudaEventSynchronize(ev));
+    MUDA(mudaEventQuery(ev));
+
+    MUDA(mudaStreamWaitEvent(s, ev, 0));
+    MUDA(mudaStreamSynchronize(s));
+    MUDA(mudaStreamQuery(s));
+
+    MUDA(mudaEventDestroy(ev));
+    MUDA(mudaStreamDestroy(s));
+}
+
 int main(void)
 {
     printf("muda %d.%d.%d test suite\n\n",
@@ -371,12 +616,20 @@ int main(void)
     }
 
     test_device();
+    test_device_queries();
     test_memory();
+    test_pointer_attributes();
+    test_memcpy_2d();
+    test_memset_d32();
     test_vector_add();
     test_saxpy();
     test_shared_syncthreads();
     test_2d();
+    test_packed_launch();
+    test_launch_ex();
+    test_func_attributes();
     test_streams_and_events();
+    test_stream_event_query();
 
     mudaModuleUnload(g_mod);
     mudaShutdown();

@@ -3,15 +3,16 @@
 **A minimal, self-contained CUDA-compatible runtime that runs kernels on the
 NVIDIA Tesla M40 — without linking or loading the CUDA driver (`libcuda`).**
 
-`muda` implements a small subset of the CUDA driver API and ships its own
-device-driver layer.  The default driver translates CUDA-style kernel source
-into OpenCL C at run time and dispatches it to the GPU.  This makes it possible
-to keep using Maxwell (`sm_52`) hardware even with CUDA toolkits that no longer
-ship `sm_52` binaries.
+`muda` implements a small subset of the CUDA driver API, a CUDA **runtime**
+shim (`mudart`), a row-major linear algebra library (`mudaBLAS`) and a Python
+binding.  It ships its own device-driver layer: the default driver translates
+CUDA-style kernel source into OpenCL C at run time and dispatches it to the
+GPU.  This makes it possible to keep using Maxwell (`sm_52`) hardware even
+with CUDA toolkits that no longer ship `sm_52` binaries.
 
 ```
-   your program
-        |  muda.h  (CUDA-like API)
+   your program / python/muda.py
+        |  muda.h | mudart.h | mudablas.h
         v
    libmuda.so  ---- driver layer ---- OpenCL ICD ---- Tesla M40
         |
@@ -33,8 +34,9 @@ NVIDIA OpenCL runtime still exposes it.
 
 ## Status
 
-Tested on **Tesla M40 (sm_52)**, driver 580.178.04.  `make test` runs two
-suites — the core runtime (35 checks) and mudaBLAS (18 checks) — all passing.
+Tested on **Tesla M40 (sm_52)**, driver 580.178.04.  `make test` runs three
+suites — the core runtime (35 checks), mudaBLAS (18) and the CUDA runtime shim
+(11) — all passing.
 
 Benchmarks (single run, not tuned):
 
@@ -44,7 +46,9 @@ Benchmarks (single run, not tuned):
 | `saxpy` (4M floats) | ~0.24 ms, ~210 GB/s |
 | `matmul` 256x256 tiled | ~0.09 ms, ~390 GFLOP/s |
 | `bench_gemm` 1024³ (tuned) | ~1.17 TFLOP/s |
+| `bench_gemm` 2048³ (tuned) | ~1.49 TFLOP/s |
 | `mlp` (2-32-32-1, 4k epochs) | 94% accuracy (95% is Bayes-optimal with 5% label noise) |
+| `python/demo_matmul.py` 2048³ | ~1.49 TFLOP/s (same kernel, no host traffic) |
 
 ## Build
 
@@ -53,13 +57,18 @@ No CUDA and no OpenCL development headers are required.
 ```sh
 make            # builds build/libmuda.{so,a}, build/mudainfo,
                 # build/vector_add, build/saxpy, build/matmul,
-                # build/bench_gemm, build/mlp,
-                # build/test_muda and build/test_mudablas
-make test       # runs both test suites
+                # build/bench_gemm, build/mlp and the test binaries
+make test       # runs all three test suites
 ```
 
 Requirements: a C11 compiler, `make`, and `libdl`.  At run time `libOpenCL.so.1`
-must be present (it is part of the NVIDIA driver on this machine).
+must be present (it is part of the NVIDIA driver on this machine).  The Python
+binding additionally needs `numpy`:
+
+```sh
+uv venv .venv && uv pip install --python .venv/bin/python numpy
+make python PYTHON=.venv/bin/python
+```
 
 ## Quick start
 
@@ -140,6 +149,32 @@ address-space qualifier, so ordinary CUDA signatures such as
 `void k(const float *a, float *b)` work unchanged.  Kernel arguments are passed
 exactly like `cuLaunchKernel`: an array of pointers to the argument values.
 
+## CUDA runtime shim (`mudart`)
+
+`include/mudart.h` + `src/mudart.c` provide the CUDA **runtime** API names on
+top of muda: `cudaMalloc`, `cudaMemcpy`, `cudaMemset`, `cudaMemGetInfo`,
+`cudaStream*`, `cudaEvent*`, `cudaGetDevice*`, `cudaDeviceSynchronize`,
+`cudaGetLastError`, and a launch bridge.  Kernels are still loaded by name
+(there is no `nvcc` in the loop):
+
+```c
+#include "mudart.h"
+
+mudaFunction_t fn;
+mudaModule_t mod;
+mudaModuleLoadData(&mod, kernel_src);
+mudaModuleGetFunction(&fn, mod, "vector_add");
+
+int n = 1 << 20;
+void *args[] = { &da, &db, &dc, &n };
+cudaLaunchKernel((const void *)fn, make_dim3(grid, 1, 1),
+                 make_dim3(256, 1, 1), args, 0, NULL);
+cudaDeviceSynchronize();
+```
+
+The legacy `cudaConfigureCall` / `cudaSetupArgument` / `cudaLaunch` sequence is
+supported too.  `tests/test_mudart.c` exercises both.
+
 ## mudaBLAS
 
 `include/mudablas.h` + `src/mudablas.c` add a small **row-major** linear
@@ -173,21 +208,49 @@ classification task using only `mudaSgemm` and the elementwise kernels,
 reaching ~94% accuracy (the Bayes limit is 95% given the injected 5% label
 noise).
 
+## Python binding
+
+`python/muda.py` is a pure-`ctypes` binding (nothing to compile on the Python
+side).  It locates `build/libmuda.so`, exposes the runtime, device queries,
+modules, kernels, streams and events, and offers numpy interop plus
+`muda.matmul` / `muda.gemm` / `muda.saxpy` backed by mudaBLAS.
+
+```python
+import numpy as np, muda
+muda.init()
+print(muda.device_info())
+
+A = np.random.rand(1024, 1024).astype(np.float32)
+B = np.random.rand(1024, 1024).astype(np.float32)
+C = muda.matmul(A, B)          # ~1.37 TFLOP/s on the M40 (kernel only)
+
+mod = muda.Module(open("kernel.cu").read())
+vadd = mod.function("vector_add")
+vadd(grid=4096, block=256, args=[da, db, dc, n], sync=True)
+```
+
+See `python/demo_kernel.py` (load + launch a kernel from source) and
+`python/demo_matmul.py` (mudaBLAS benchmark).
+
 ## Architecture
 
 ```
 include/muda.h          public CUDA-like API
 include/mudablas.h      row-major linear algebra API
+include/mudart.h        CUDA runtime API shim
 src/muda.c              runtime state + dispatch to the active driver
 src/muda_internal.h     the muda_driver vtable (the "driver ABI")
 src/muda_translate.c    CUDA C -> OpenCL C rewriter
 src/driver_opencl.c     default driver: dlopen(libOpenCL) + dispatch
 src/mudablas.c          SGEMM/SGEMV and elementwise kernels
+src/mudart.c            CUDA runtime shim implementation
 src/cl_min.h            hand-written minimal OpenCL declarations
 tools/mudainfo.c        device/PCI information tool
 examples/*.c            vector_add, saxpy, matmul, bench_gemm, mlp
+python/muda.py          ctypes binding + numpy interop
 tests/test_muda.c       core test suite
 tests/test_mudablas.c   linear algebra test suite
+tests/test_mudart.c     CUDA runtime shim test suite
 ```
 
 A *muda driver* is a vtable of `init`, `malloc`, `memcpy`, `module_load`,
@@ -217,14 +280,15 @@ build log.
 
 ## Roadmap
 
-Done: core CUDA-compatible API (0.2.0) and the first linear-algebra /
-real-workload layer (0.3.0: mudaBLAS, GEMM benchmark, MLP training demo).
+Done: core CUDA-compatible API (0.2.0), linear algebra + real-workload layer
+(0.3.0: mudaBLAS, GEMM benchmark, MLP training), and the CUDA runtime shim +
+Python binding (0.4.0).
 
 Next:
 
-* A drop-in CUDA **runtime** shim (`cudaMalloc`, `cudaMemcpy`,
-  `cudaLaunchKernel`, ...) so existing `.cu` files compile against muda
-  unchanged, plus a Python (`ctypes`) binding.
+* A tiny source preprocessor that rewrites `kernel<<<grid, block>>>(...)` into
+  `cudaLaunchKernel(...)`, so `.cu` files using `<<<>>>` compile unchanged
+  (there is still no `nvcc`; the muda driver compiles the kernels).
 * `driver_opencl`: multiple local-memory parameters, double-buffered GEMM,
   stream priority and overlap hints.
 * `driver_cpu`: a reference driver so the test suite runs without a GPU.

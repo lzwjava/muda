@@ -5,18 +5,20 @@
 
 CC      ?= cc
 AR      ?= ar
+PYTHON  ?= python3
 CFLAGS  ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS += -D_GNU_SOURCE -Iinclude -Isrc
 LDLIBS  += -ldl -lpthread -lm
 
 BUILD   := build
-LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c src/mudablas.c
+LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c src/mudablas.c src/mudart.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul \
-           $(BUILD)/bench_gemm $(BUILD)/mlp $(BUILD)/test_muda $(BUILD)/test_mudablas
+           $(BUILD)/bench_gemm $(BUILD)/mlp $(BUILD)/test_muda \
+           $(BUILD)/test_mudablas $(BUILD)/test_mudart
 
-.PHONY: all clean test
+.PHONY: all clean test python
 all: $(BUILD)/libmuda.so $(BUILD)/libmuda.a $(BINS)
 
 $(BUILD):
@@ -55,9 +57,17 @@ $(BUILD)/mlp: examples/mlp.c $(BUILD)/libmuda.a | $(BUILD)
 $(BUILD)/test_mudablas: tests/test_mudablas.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
-test: $(BUILD)/test_muda $(BUILD)/test_mudablas
+$(BUILD)/test_mudart: tests/test_mudart.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+test: $(BUILD)/test_muda $(BUILD)/test_mudablas $(BUILD)/test_mudart
 	$(BUILD)/test_muda
 	$(BUILD)/test_mudablas
+	$(BUILD)/test_mudart
+
+python: all
+	$(PYTHON) python/demo_kernel.py
+	$(PYTHON) python/demo_matmul.py
 
 clean:
 	rm -rf $(BUILD)

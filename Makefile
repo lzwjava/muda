@@ -18,7 +18,7 @@ LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul \
            $(BUILD)/bench_gemm $(BUILD)/mlp $(BUILD)/test_muda \
-           $(BUILD)/test_mudablas $(BUILD)/test_mudart \
+           $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/test_translate \
            $(BUILD)/mudac $(BUILD)/vector_add_mudac $(BUILD)/test_mudac
 
 .PHONY: all clean test python
@@ -60,6 +60,9 @@ $(BUILD)/mlp: examples/mlp.c $(BUILD)/libmuda.a | $(BUILD)
 $(BUILD)/test_mudablas: tests/test_mudablas.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
+$(BUILD)/test_translate: tests/test_translate.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
 $(BUILD)/test_mudart: tests/test_mudart.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
@@ -78,10 +81,11 @@ $(BUILD)/test_mudac.c: tests/test_mudac.cu $(BUILD)/mudac | $(BUILD)
 $(BUILD)/test_mudac: $(BUILD)/test_mudac.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -x c++ -o $@ $(BUILD)/test_mudac.c -x none $(BUILD)/libmuda.a $(LDLIBS)
 
-test: $(BUILD)/test_muda $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/vector_add_mudac $(BUILD)/test_mudac
+test: $(BUILD)/test_muda $(BUILD)/test_mudablas $(BUILD)/test_mudart $(BUILD)/test_translate $(BUILD)/vector_add_mudac $(BUILD)/test_mudac
 	$(BUILD)/test_muda
 	$(BUILD)/test_mudablas
 	$(BUILD)/test_mudart
+	$(BUILD)/test_translate
 	$(BUILD)/vector_add_mudac
 	$(BUILD)/test_mudac
 

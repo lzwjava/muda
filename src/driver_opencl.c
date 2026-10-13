@@ -773,7 +773,7 @@ static int opencl_module_load(void *drv_ctx, const char *source, void **mod_out)
     if (err != CL_SUCCESS || !prog)
         return mudaErrorInvalidValue;
 
-    err = g_cl.BuildProgram(prog, 1, &c->dev, NULL, NULL, NULL);
+    err = g_cl.BuildProgram(prog, 1, &c->dev, getenv("MUDA_CL_OPTIONS"), NULL, NULL);
     if (err != CL_SUCCESS || getenv("MUDA_VERBOSE")) {
         size_t log_size = 0;
         g_cl.GetProgramBuildInfo(prog, c->dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);

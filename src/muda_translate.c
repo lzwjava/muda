@@ -101,6 +101,30 @@ static const char *space_type(const char *name)
     return NULL;
 }
 
+/* Skip whitespace then a balanced parenthesised group (used to drop
+ * qualifiers such as __launch_bounds__(...) and __align__(...)). */
+static const char *skip_paren(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (*p != '(')
+        return p;
+    int depth = 0;
+    while (*p) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            p++;
+            if (depth == 0)
+                break;
+            continue;
+        }
+        p++;
+    }
+    return p;
+}
+
 /* ------------------------------------------------------------------ */
 /* Preamble: shims for the remaining CUDA-isms                        */
 /* ------------------------------------------------------------------ */
@@ -116,6 +140,78 @@ static const char *kPreamble =
     " { return (float4)(x, y, z, w); }\n"
     "static inline int2 make_int2(int x, int y) { return (int2)(x, y); }\n"
     "static inline int4 make_int4(int x, int y, int z, int w) { return (int4)(x, y, z, w); }\n"
+    "\n"
+    "/* CUDA math intrinsics */\n"
+    "#define __fdividef(a, b)   ((a) / (b))\n"
+    "#define __expf(x)          exp(x)\n"
+    "#define __exp10f(x)        exp10(x)\n"
+    "#define __logf(x)          log(x)\n"
+    "#define __log2f(x)         log2(x)\n"
+    "#define __log10f(x)        log10(x)\n"
+    "#define __powf(x, y)       pow((x), (y))\n"
+    "#define __sinf(x)          sin(x)\n"
+    "#define __cosf(x)          cos(x)\n"
+    "#define __tanf(x)          tan(x)\n"
+    "#define __sqrtf(x)         sqrt(x)\n"
+    "#define rsqrtf(x)          rsqrt(x)\n"
+    "#define __frsqrt_rn(x)     rsqrt(x)\n"
+    "#define fmaf(a, b, c)      fma((a), (b), (c))\n"
+    "#define __saturatef(x)     clamp((x), 0.0f, 1.0f)\n"
+    "#define __ldg(p)           (*(p))\n"
+    "\n"
+    "/* CUDA atomics, dispatched on the pointee type via clang builtins */\n"
+    "#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable\n"
+    "static inline int __muda_atomicAdd_i(__global void *p, int v)"
+    " { return atomic_add((volatile __global int *)p, v); }\n"
+    "static inline unsigned long __muda_atomicAdd_ul(__global void *p, unsigned long v)"
+    " { return atomic_add((volatile __global unsigned long *)p, v); }\n"
+    "static inline float __muda_atomicAdd_f(__global void *p, float v) {\n"
+    "    union { unsigned int u; float f; } o, n;\n"
+    "    do { o.f = *(volatile __global float *)p; n.f = o.f + v; }\n"
+    "    while (atomic_cmpxchg((volatile __global unsigned int *)p, o.u, n.u) != o.u);\n"
+    "    return o.f;\n"
+    "}\n"
+    "static inline int __muda_atomicExch_i(__global void *p, int v)"
+    " { return atomic_xchg((volatile __global int *)p, v); }\n"
+    "static inline unsigned int __muda_atomicExch_u(__global void *p, unsigned int v)"
+    " { return atomic_xchg((volatile __global unsigned int *)p, v); }\n"
+    "static inline float __muda_atomicExch_f(__global void *p, float v) {\n"
+    "    union { unsigned int u; float f; } o, n; n.f = v;\n"
+    "    o.u = atomic_xchg((volatile __global unsigned int *)p, n.u);\n"
+    "    return o.f;\n"
+    "}\n"
+    "static inline int __muda_atomicMax_i(__global void *p, int v)"
+    " { return atomic_max((volatile __global int *)p, v); }\n"
+    "static inline unsigned int __muda_atomicMax_u(__global void *p, unsigned int v)"
+    " { return atomic_max((volatile __global unsigned int *)p, v); }\n"
+    "static inline int __muda_atomicMin_i(__global void *p, int v)"
+    " { return atomic_min((volatile __global int *)p, v); }\n"
+    "static inline unsigned int __muda_atomicMin_u(__global void *p, unsigned int v)"
+    " { return atomic_min((volatile __global unsigned int *)p, v); }\n"
+    "static inline int __muda_atomicCAS_i(__global void *p, int cmp, int v)"
+    " { return (int)atomic_cmpxchg((volatile __global int *)p, cmp, v); }\n"
+    "static inline unsigned int __muda_atomicCAS_u(__global void *p, unsigned int cmp, unsigned int v)"
+    " { return atomic_cmpxchg((volatile __global unsigned int *)p, cmp, v); }\n"
+    "#define __MUDA_IS_FLOAT(p) __builtin_types_compatible_p(__typeof__(*(p)), float)\n"
+    "#define __MUDA_IS_UINT(p)  __builtin_types_compatible_p(__typeof__(*(p)), unsigned int)\n"
+    "#define __MUDA_IS_ULONG(p) __builtin_types_compatible_p(__typeof__(*(p)), unsigned long)\n"
+    "#define atomicAdd(p, v) \\\n"
+    "    (__MUDA_IS_FLOAT(p) ? __muda_atomicAdd_f((__global void *)(p), (v)) : \\\n"
+    "     (__MUDA_IS_ULONG(p) ? __muda_atomicAdd_ul((__global void *)(p), (v)) : \\\n"
+    "      __muda_atomicAdd_i((__global void *)(p), (v))))\n"
+    "#define atomicExch(p, v) \\\n"
+    "    (__MUDA_IS_FLOAT(p) ? __muda_atomicExch_f((__global void *)(p), (v)) : \\\n"
+    "     (__MUDA_IS_UINT(p) ? __muda_atomicExch_u((__global void *)(p), (v)) : \\\n"
+    "      __muda_atomicExch_i((__global void *)(p), (v))))\n"
+    "#define atomicMax(p, v) \\\n"
+    "    (__MUDA_IS_UINT(p) ? __muda_atomicMax_u((__global void *)(p), (v)) : \\\n"
+    "     __muda_atomicMax_i((__global void *)(p), (v)))\n"
+    "#define atomicMin(p, v) \\\n"
+    "    (__MUDA_IS_UINT(p) ? __muda_atomicMin_u((__global void *)(p), (v)) : \\\n"
+    "     __muda_atomicMin_i((__global void *)(p), (v)))\n"
+    "#define atomicCAS(p, cmp, v) \\\n"
+    "    (__MUDA_IS_UINT(p) ? __muda_atomicCAS_u((__global void *)(p), (cmp), (v)) : \\\n"
+    "     __muda_atomicCAS_i((__global void *)(p), (cmp), (v)))\n"
     "\n";
 
 /* ------------------------------------------------------------------ */
@@ -171,8 +267,17 @@ static void rewrite_body(const char *src, sbuf *out)
             if (strcmp(ident, "__global__") == 0) {
                 sbuf_puts(out, "__kernel");
             } else if (strcmp(ident, "__device__") == 0 ||
-                       strcmp(ident, "__host__") == 0) {
+                       strcmp(ident, "__host__") == 0 ||
+                       strcmp(ident, "__noinline__") == 0 ||
+                       strcmp(ident, "__device_builtin__") == 0) {
                 /* drop */
+            } else if (strcmp(ident, "__launch_bounds__") == 0 ||
+                       strcmp(ident, "__align__") == 0 ||
+                       strcmp(ident, "__builtin_align__") == 0) {
+                p = skip_paren(p); /* drop token and its (...) */
+            } else if (strcmp(ident, "__forceinline__") == 0 ||
+                       strcmp(ident, "__inline__") == 0) {
+                sbuf_puts(out, "inline");
             } else if (strcmp(ident, "__shared__") == 0) {
                 sbuf_puts(out, "__local");
             } else if (strcmp(ident, "__constant__") == 0) {

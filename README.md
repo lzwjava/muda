@@ -11,12 +11,13 @@ GPU.  This makes it possible to keep using Maxwell (`sm_52`) hardware even
 with CUDA toolkits that no longer ship `sm_52` binaries.
 
 ```
-   your program / python/muda.py
-        |  muda.h | mudart.h | mudablas.h
-        v
-   libmuda.so  ---- driver layer ---- OpenCL ICD ---- Tesla M40
-        |
-        +-- CUDA C  ->  OpenCL C  translator
+   your .cu program --(mudac)--> C/C++ --+
+                                        |  muda.h | mudart.h | mudablas.h
+   python/muda.py ----------------------+
+                                        v
+                    libmuda.so ---- driver layer ---- OpenCL ICD ---- Tesla M40
+                                        |
+                                        +-- CUDA C  ->  OpenCL C  translator
 ```
 
 ## Why this exists
@@ -34,9 +35,10 @@ NVIDIA OpenCL runtime still exposes it.
 
 ## Status
 
-Tested on **Tesla M40 (sm_52)**, driver 580.178.04.  `make test` runs three
-suites — the core runtime (35 checks), mudaBLAS (18) and the CUDA runtime shim
-(11) — all passing.
+Tested on **Tesla M40 (sm_52)**, driver 580.178.04.  `make test` runs the core
+runtime (35 checks), mudaBLAS (18) and the CUDA runtime shim (11); builds an
+ordinary `<<<>>>` CUDA program through `mudac`; and runs the `mudac`
+launch-rewrite tests (1D int dims, 2D `dim3`, scalar arguments).
 
 Benchmarks (single run, not tuned):
 
@@ -55,10 +57,10 @@ Benchmarks (single run, not tuned):
 No CUDA and no OpenCL development headers are required.
 
 ```sh
-make            # builds build/libmuda.{so,a}, build/mudainfo,
-                # build/vector_add, build/saxpy, build/matmul,
-                # build/bench_gemm, build/mlp and the test binaries
-make test       # runs all three test suites
+make            # builds build/libmuda.{so,a}, build/mudainfo, the
+                # examples (vector_add, saxpy, matmul, bench_gemm, mlp),
+                # build/mudac and the test binaries
+make test       # runs all suites, including a mudac-built program
 ```
 
 Requirements: a C11 compiler, `make`, and `libdl`.  At run time `libOpenCL.so.1`
@@ -175,6 +177,37 @@ cudaDeviceSynchronize();
 The legacy `cudaConfigureCall` / `cudaSetupArgument` / `cudaLaunch` sequence is
 supported too.  `tests/test_mudart.c` exercises both.
 
+## `mudac` preprocessor
+
+`tools/mudac.c` is a tiny source-to-source preprocessor that lets ordinary
+`.cu` files — including the `<<<...>>>` launch syntax — compile against muda,
+still with no `nvcc`: the muda driver compiles the kernels at run time.
+
+```sh
+make build/mudac
+build/mudac prog.cu -o prog.cc
+c++ -std=gnu++17 -Iinclude prog.cc build/libmuda.a -ldl -lpthread -lm -o prog
+./prog
+```
+
+It:
+
+* extracts every `__global__`/`__device__` function into a string constant and
+  removes the definition from the host code;
+* rewrites `kernel<<<grid, block, shared, stream>>>(a, b, n)` into a call to
+  `mudartLaunchByName("kernel", ...)`, taking the address of each argument in a
+  GNU statement expression so literals and rvalues work;
+* replaces `#include <cuda_runtime.h>` with `#include "mudart.h"`.
+
+Launch dimensions may be integers or `dim3` values; the generated code picks
+whichever you wrote.  `examples/vector_add.cu` is a normal CUDA program built
+this way, and `tests/test_mudac.cu` covers 1D integer dims, 2D `dim3` dims, a
+scalar argument and several kernels in one file.
+
+It is a preprocessor, not a compiler: it handles the launch syntax and
+device-function extraction, not general C++ metaprogramming that a real `nvcc`
+would perform.
+
 ## mudaBLAS
 
 `include/mudablas.h` + `src/mudablas.c` add a small **row-major** linear
@@ -246,11 +279,14 @@ src/mudablas.c          SGEMM/SGEMV and elementwise kernels
 src/mudart.c            CUDA runtime shim implementation
 src/cl_min.h            hand-written minimal OpenCL declarations
 tools/mudainfo.c        device/PCI information tool
+tools/mudac.c           CUDA `<<<>>>` -> mudart preprocessor
 examples/*.c            vector_add, saxpy, matmul, bench_gemm, mlp
+examples/vector_add.cu  ordinary CUDA source, built through mudac
 python/muda.py          ctypes binding + numpy interop
 tests/test_muda.c       core test suite
 tests/test_mudablas.c   linear algebra test suite
 tests/test_mudart.c     CUDA runtime shim test suite
+tests/test_mudac.cu     mudac launch-rewrite tests
 ```
 
 A *muda driver* is a vtable of `init`, `malloc`, `memcpy`, `module_load`,
@@ -280,15 +316,14 @@ build log.
 
 ## Roadmap
 
-Done: core CUDA-compatible API (0.2.0), linear algebra + real-workload layer
-(0.3.0: mudaBLAS, GEMM benchmark, MLP training), and the CUDA runtime shim +
-Python binding (0.4.0).
+Done: core CUDA-compatible API (0.2.0); linear algebra + real-workload layer
+(0.3.0: mudaBLAS, GEMM benchmark, MLP training); CUDA runtime shim + Python
+binding (0.4.0); `<<<>>>` preprocessor, `mudac` (0.5.0).
 
 Next:
 
-* A tiny source preprocessor that rewrites `kernel<<<grid, block>>>(...)` into
-  `cudaLaunchKernel(...)`, so `.cu` files using `<<<>>>` compile unchanged
-  (there is still no `nvcc`; the muda driver compiles the kernels).
+* `mudac`: handle `cudaMemcpyToSymbol`, `__constant__` and `__managed__`, and
+  source-level `-I` includes, to cover more real `.cu` files.
 * `driver_opencl`: multiple local-memory parameters, double-buffered GEMM,
   stream priority and overlap hints.
 * `driver_cpu`: a reference driver so the test suite runs without a GPU.

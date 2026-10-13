@@ -9,6 +9,14 @@
 #include <string.h>
 #include <stdint.h>
 
+/* The CUDA runtime initializes itself; mudart does the same so that
+ * cudaMalloc()/cudaMemcpy() work before the first kernel launch. */
+__attribute__((constructor))
+static void mudart_runtime_init(void)
+{
+    mudaInit(0);
+}
+
 /* ------------------------------------------------------------------ */
 /* Device                                                             */
 /* ------------------------------------------------------------------ */
@@ -302,4 +310,61 @@ const char *cudaGetErrorName(cudaError_t error)
 const char *cudaGetErrorString(cudaError_t error)
 {
     return mudaGetErrorString(error);
+}
+
+/* ------------------------------------------------------------------ */
+/* Runtime kernel loading (used by the mudac preprocessor)            */
+/* ------------------------------------------------------------------ */
+static mudaModule_t g_kernel_module = NULL;
+
+typedef struct { char *name; mudaFunction_t fn; } mudart_kfunc;
+static mudart_kfunc *g_kfuncs = NULL;
+static int g_nkfuncs = 0, g_ckfuncs = 0;
+
+cudaError_t mudartLoadKernelSource(const char *source)
+{
+    if (g_kernel_module)
+        return cudaSuccess;
+    cudaError_t e = mudaInit(0);
+    if (e != cudaSuccess)
+        return e;
+    return mudaModuleLoadData(&g_kernel_module, source);
+}
+
+cudaError_t mudartLaunchByName(const char *name,
+                               unsigned int gx, unsigned int gy, unsigned int gz,
+                               unsigned int bx, unsigned int by, unsigned int bz,
+                               size_t sharedMem, cudaStream_t stream,
+                               int nargs, void **args)
+{
+    (void)nargs;
+    if (!g_kernel_module)
+        return mudaErrorNotInitialized;
+    if (!name)
+        return mudaErrorInvalidValue;
+
+    mudaFunction_t fn = NULL;
+    for (int i = 0; i < g_nkfuncs; i++) {
+        if (strcmp(g_kfuncs[i].name, name) == 0) {
+            fn = g_kfuncs[i].fn;
+            break;
+        }
+    }
+    if (!fn) {
+        cudaError_t e = mudaModuleGetFunction(&fn, g_kernel_module, name);
+        if (e != cudaSuccess)
+            return e;
+        if (g_nkfuncs == g_ckfuncs) {
+            g_ckfuncs = g_ckfuncs ? g_ckfuncs * 2 : 16;
+            g_kfuncs = (mudart_kfunc *)realloc(g_kfuncs, (size_t)g_ckfuncs * sizeof(*g_kfuncs));
+            if (!g_kfuncs)
+                return mudaErrorOutOfMemory;
+        }
+        g_kfuncs[g_nkfuncs].name = strdup(name);
+        g_kfuncs[g_nkfuncs].fn = fn;
+        g_nkfuncs++;
+    }
+
+    return mudaLaunchKernel(fn, gx, gy, gz, bx, by, bz,
+                            (unsigned)sharedMem, stream, args, NULL);
 }

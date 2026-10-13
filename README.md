@@ -49,10 +49,10 @@ Benchmarks (single run, not tuned):
 | `vector_add` (1M floats) | ~0.18 ms, ~70 GB/s |
 | `saxpy` (4M floats) | ~0.24 ms, ~210 GB/s |
 | `matmul` 256x256 tiled | ~0.09 ms, ~390 GFLOP/s |
-| `bench_gemm` 1024³ (tuned) | ~1.17 TFLOP/s |
-| `bench_gemm` 2048³ (tuned) | ~1.49 TFLOP/s |
+| `bench_gemm` 1024³ (tuned) | ~1.58 TFLOP/s |
+| `bench_gemm` 2048³ (tuned) | ~1.79 TFLOP/s |
 | `mlp` (2-32-32-1, 4k epochs) | 94% accuracy (95% is Bayes-optimal with 5% label noise) |
-| `python/demo_matmul.py` 2048³ | ~1.49 TFLOP/s (same kernel, no host traffic) |
+| `python/demo_matmul.py` 2048³ | ~1.73 TFLOP/s (same kernel, no host traffic) |
 
 ## Build
 
@@ -232,7 +232,7 @@ algebra library built entirely on muda kernels:
 
 | function | operation |
 | --- | --- |
-| `mudaSgemm` | `C = alpha*op(A)*op(B) + beta*C`, shared-memory + 4x4 register-blocked |
+| `mudaSgemm` | `C = alpha*op(A)*op(B) + beta*C`, shared-memory + register-blocked (64x64/4x4 below 1024, 128x64/8x4 above) |
 | `mudaSgemmNaive` | same, one thread per output element (reference) |
 | `mudaSgemv` | `y = alpha*op(A)*x + beta*y` |
 | `mudaSaxpy` | `y = alpha*x + y` (float4 path) |
@@ -248,9 +248,10 @@ naive and tuned kernels:
 
 ```
     size  naive GFLOP/s  tuned GFLOP/s    speedup
-     256          233.9          519.6      2.22x
-     512          273.3         1104.1      4.04x
-    1024          243.8         1171.4      4.80x
+     256          275.8          603.4      2.19x
+     512          320.4         1291.4      4.03x
+    1024          286.2         1577.7      5.51x
+    2048          318.6         1785.2      5.60x
 ```
 
 `examples/mlp.c` trains a 2-32-32-1 ReLU/sigmoid MLP on a nonlinear circle
@@ -377,7 +378,8 @@ Done: core CUDA-compatible API (0.2.0); linear algebra + real-workload layer
 binding (0.4.0); `<<<>>>` preprocessor, `mudac` (0.5.0); expanded CUDA source
 compatibility - intrinsics, atomics, qualifiers (0.6.0); CPU reference driver +
 reduction example (0.7.0); native DRM/nouveau memory backend + driver switch
-tool (0.8.0, experimental).
+tool (0.8.0, experimental); faster SGEMM with a 128x64/8x4 kernel
+(~1.8 TFLOP/s at 2048³, 0.9.0).
 
 Next: give `driver_nouveau` a compute channel (pushbuffer + channel classes)
 so kernels can run with no NVIDIA user space at all; until then it is a memory

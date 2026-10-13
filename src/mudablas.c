@@ -103,6 +103,73 @@ static const char *kBlasSource =
 "    }\n"
 "}\n"
 "\n"
+"#define R2_BM 128\n"
+"#define R2_BN 64\n"
+"#define R2_BK 16\n"
+"#define R2_TM 8\n"
+"#define R2_TN 4\n"
+"__global__ void sgemm_rb128(int M, int N, int K, float alpha,\n"
+"                            const float *A, int lda, int ta,\n"
+"                            const float *B, int ldb, int tb,\n"
+"                            float beta, float *C, int ldc)\n"
+"{\n"
+"    __shared__ float As[R2_BM][R2_BK];\n"
+"    __shared__ float Bs[R2_BK][R2_BN];\n"
+"    int tx = threadIdx.x;\n"
+"    int ty = threadIdx.y;\n"
+"    int tid = ty * 16 + tx;\n"
+"    int row0 = blockIdx.y * R2_BM + ty * R2_TM;\n"
+"    int col0 = blockIdx.x * R2_BN + tx * R2_TN;\n"
+"    float acc[R2_TM][R2_TN];\n"
+"    for (int i = 0; i < R2_TM; i++)\n"
+"        for (int j = 0; j < R2_TN; j++)\n"
+"            acc[i][j] = 0.0f;\n"
+"    for (int t = 0; t < K; t += R2_BK) {\n"
+"        for (int i = 0; i < (R2_BM * R2_BK) / 256; i++) {\n"
+"            int idx = i * 256 + tid;\n"
+"            int r = idx / R2_BK;\n"
+"            int c = idx % R2_BK;\n"
+"            int gr = blockIdx.y * R2_BM + r;\n"
+"            int gc = t + c;\n"
+"            float v = 0.0f;\n"
+"            if (gr < M && gc < K) v = ta ? A[gc * lda + gr] : A[gr * lda + gc];\n"
+"            As[r][c] = v;\n"
+"        }\n"
+"        for (int i = 0; i < (R2_BK * R2_BN) / 256; i++) {\n"
+"            int idx = i * 256 + tid;\n"
+"            int r = idx / R2_BN;\n"
+"            int c = idx % R2_BN;\n"
+"            int gr = t + r;\n"
+"            int gc = blockIdx.x * R2_BN + c;\n"
+"            float v = 0.0f;\n"
+"            if (gr < K && gc < N) v = tb ? B[gc * ldb + gr] : B[gr * ldb + gc];\n"
+"            Bs[r][c] = v;\n"
+"        }\n"
+"        __syncthreads();\n"
+"        for (int kk = 0; kk < R2_BK; kk++) {\n"
+"            float aReg[R2_TM];\n"
+"            float bReg[R2_TN];\n"
+"            for (int i = 0; i < R2_TM; i++) aReg[i] = As[ty * R2_TM + i][kk];\n"
+"            for (int j = 0; j < R2_TN; j++) bReg[j] = Bs[kk][tx * R2_TN + j];\n"
+"            for (int i = 0; i < R2_TM; i++)\n"
+"                for (int j = 0; j < R2_TN; j++)\n"
+"                    acc[i][j] += aReg[i] * bReg[j];\n"
+"        }\n"
+"        __syncthreads();\n"
+"    }\n"
+"    for (int i = 0; i < R2_TM; i++) {\n"
+"        for (int j = 0; j < R2_TN; j++) {\n"
+"            int r = row0 + i;\n"
+"            int c = col0 + j;\n"
+"            if (r < M && c < N) {\n"
+"                float v = alpha * acc[i][j];\n"
+"                if (beta != 0.0f) v += beta * C[r * ldc + c];\n"
+"                C[r * ldc + c] = v;\n"
+"            }\n"
+"        }\n"
+"    }\n"
+"}\n"
+"\n"
 "__global__ void sgemv(int M, int N, float alpha, const float *A, int lda, int ta,\n"
 "                      const float *x, int incx, float beta, float *y, int incy)\n"
 "{\n"
@@ -192,6 +259,7 @@ static int             g_ready = 0;
 static mudaModule_t    g_mod = NULL;
 
 static mudaFunction_t g_f_sgemm_rb;
+static mudaFunction_t g_f_sgemm_rb128;
 static mudaFunction_t g_f_sgemm_naive;
 static mudaFunction_t g_f_sgemv;
 static mudaFunction_t g_f_saxpy;
@@ -225,6 +293,7 @@ static mudaError_t ensure_ready(void)
         }                                                                   \
     } while (0)
     GET(g_f_sgemm_rb,    "sgemm_rb");
+    GET(g_f_sgemm_rb128, "sgemm_rb128");
     GET(g_f_sgemm_naive, "sgemm_naive");
     GET(g_f_sgemv,       "sgemv");
     GET(g_f_saxpy,       "saxpy");
@@ -279,6 +348,11 @@ mudaError_t mudaSgemm(int transa, int transb, int m, int n, int k,
     mudaError_t e = ensure_ready();
     if (e != mudaSuccess)
         return e;
+    /* The 128x128 tile wins for larger matrices; 64x64 is better for
+     * small ones (less wasted work and lower register pressure). */
+    if (m >= 1024 && n >= 1024)
+        return sgemm_impl(g_f_sgemm_rb128, 64, 128, 16, 16, transa, transb, m, n, k,
+                          alpha, A, lda, B, ldb, beta, C, ldc);
     return sgemm_impl(g_f_sgemm_rb, 64, 64, 16, 16, transa, transb, m, n, k,
                       alpha, A, lda, B, ldb, beta, C, ldc);
 }

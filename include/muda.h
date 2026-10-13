@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define MUDA_VERSION_MAJOR 0
-#define MUDA_VERSION_MINOR 8
+#define MUDA_VERSION_MINOR 9
 #define MUDA_VERSION_PATCH 0
 
 /* Version integer in the same layout as CUDA: major*1000 + minor*10. */

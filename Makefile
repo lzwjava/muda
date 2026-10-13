@@ -7,13 +7,14 @@ CC      ?= cc
 AR      ?= ar
 CFLAGS  ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter
 CPPFLAGS += -D_GNU_SOURCE -Iinclude -Isrc
-LDLIBS  += -ldl -lpthread
+LDLIBS  += -ldl -lpthread -lm
 
 BUILD   := build
-LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c
+LIB_SRC := src/muda.c src/driver_opencl.c src/muda_translate.c src/mudablas.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
-BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul $(BUILD)/test_muda
+BINS    := $(BUILD)/mudainfo $(BUILD)/vector_add $(BUILD)/saxpy $(BUILD)/matmul \
+           $(BUILD)/bench_gemm $(BUILD)/mlp $(BUILD)/test_muda $(BUILD)/test_mudablas
 
 .PHONY: all clean test
 all: $(BUILD)/libmuda.so $(BUILD)/libmuda.a $(BINS)
@@ -45,8 +46,18 @@ $(BUILD)/matmul: examples/matmul.c $(BUILD)/libmuda.a | $(BUILD)
 $(BUILD)/test_muda: tests/test_muda.c $(BUILD)/libmuda.a | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
 
-test: $(BUILD)/test_muda
+$(BUILD)/bench_gemm: examples/bench_gemm.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+$(BUILD)/mlp: examples/mlp.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+$(BUILD)/test_mudablas: tests/test_mudablas.c $(BUILD)/libmuda.a | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $< $(BUILD)/libmuda.a $(LDLIBS)
+
+test: $(BUILD)/test_muda $(BUILD)/test_mudablas
 	$(BUILD)/test_muda
+	$(BUILD)/test_mudablas
 
 clean:
 	rm -rf $(BUILD)
